@@ -223,7 +223,10 @@ const TOOLS = [
   { name: "browser_console", cmd: "console", description: "Logs/erros de console capturados desde o carregamento. Filtre por nível.", inputSchema: { type: "object", properties: { tabId: TABID, limit: { type: "number" }, level: { type: "string", enum: ["log", "info", "warn", "error", "debug"] } } } },
   { name: "browser_network", cmd: "network", description: "Requisições de rede recentes da aba (método, url, status, tipo, duração). Capturado por fetch/XHR na página.", inputSchema: { type: "object", properties: { tabId: TABID, limit: { type: "number" }, filter: { type: "string", description: "substring da url para filtrar" } } } },
   { name: "browser_eval", cmd: "eval", description: "Executa JavaScript na página (via chrome.debugger) e retorna o resultado. Aceita await. Funciona em abas de fundo.", inputSchema: { type: "object", properties: { tabId: TABID, code: { type: "string" } }, required: ["code"] } },
-  { name: "browser_screenshot", cmd: "screenshot", description: "PNG da página (viewport), de um elemento (selector) ou da página inteira (fullPage). Via CDP, funciona em segundo plano.", inputSchema: { type: "object", properties: { tabId: TABID, selector: { type: "string" }, fullPage: { type: "boolean" } } } },
+  { name: "browser_screenshot", cmd: "screenshot", description: "Foto da página (viewport), de um elemento (selector) ou inteira (fullPage). Barata por padrão: JPEG reduzido (~1280px de largura); ajuste maxWidth/format/quality. Via CDP, funciona em segundo plano. DICA de custo: para DADOS use browser_read/browser_eval/browser_query; use a foto para VALIDAÇÃO VISUAL (aparência, cor, layout). Para ver E agir no mesmo quadro, prefira browser_look.", inputSchema: { type: "object", properties: { tabId: TABID, selector: { type: "string" }, fullPage: { type: "boolean" }, maxWidth: { type: "number", description: "largura máx. em px (padrão 1280; reduz custo)" }, format: { type: "string", enum: ["jpeg", "png"], description: "padrão jpeg (mais leve)" }, quality: { type: "number", description: "qualidade JPEG 20-95 (padrão 72)" } } } },
+  { name: "browser_look", cmd: "look", description: "OLHA a tela para ver E agir no mesmo quadro: screenshot LEVE com os elementos interativos NUMERADOS (set-of-marks) + o mapa número→ref/papel/rótulo. Clique/preencha por 'ref' (ex.: browser_click {ref:'r12'}), sem seletor frágil. Os números aparecem na foto (o modelo vê) e na tela (o usuário vê). É o jeito recomendado de perceber a página quando você vai interagir com ela.", inputSchema: { type: "object", properties: { tabId: TABID, limit: { type: "number", description: "máx. de elementos marcados (padrão 100)" }, maxWidth: { type: "number" }, quality: { type: "number" }, keepMarks: { type: "boolean", description: "mantém os números na tela alguns segundos" } } } },
+  { name: "browser_inspect", cmd: "inspect", description: "Inspeciona UM elemento (por selector, ref ou text): estilos computados, box model, atributos, a11y e um trecho de HTML — como o inspetor do DevTools. Destaca o elemento na tela por um instante.", inputSchema: { type: "object", properties: { tabId: TABID, selector: { type: "string" }, ref: { type: "string" }, text: { type: "string" } } } },
+  { name: "browser_observe", cmd: "observe", description: "O que MUDOU no DOM desde a última observação (adições/remoções/atributos/texto). Comece com reset:true para (re)iniciar; depois chame sem reset para pegar só o delta. Ideal para loops de ajuste sem re-fotografar a página inteira.", inputSchema: { type: "object", properties: { tabId: TABID, reset: { type: "boolean", description: "(re)inicia a observação" }, limit: { type: "number" } } } },
   { name: "browser_wait", cmd: "wait", description: "Espera uma condição antes de continuar: elemento visível/oculto (selector+state), a url conter algo (urlContains), ou tempo (timeoutMs). Essencial em SPAs.", inputSchema: { type: "object", properties: { tabId: TABID, selector: { type: "string" }, state: { type: "string", enum: ["visible", "hidden"] }, urlContains: { type: "string" }, timeoutMs: { type: "number" } } } },
   // --- Ação ---
   { name: "browser_click", cmd: "click", description: "Clica no elemento: por 'selector' CSS, 'ref' (de browser_snapshot) ou 'text'. Rola até ele, espera ficar visível, e move o cursor vermelho animado. Use real=true para eventos de mouse REAIS via CDP (sites que rejeitam cliques sintéticos).", inputSchema: { type: "object", properties: { tabId: TABID, selector: { type: "string" }, ref: { type: "string" }, text: { type: "string" }, real: { type: "boolean", description: "clique com eventos reais de mouse (CDP Input)" } } } },
@@ -275,9 +278,18 @@ async function callTool(name, args) {
   const reply = await dispatch(tool.cmd, args);
   if (!reply.ok) return { content: [{ type: "text", text: "Erro: " + (reply.error || "falha desconhecida") }], isError: true };
   if (name === "browser_screenshot") {
-    const dataUrl = reply.result && reply.result.dataUrl;
-    if (!dataUrl) return { content: [{ type: "text", text: "Erro: sem screenshot" }], isError: true };
-    return { content: [{ type: "image", data: dataUrl.replace(/^data:image\/png;base64,/, ""), mimeType: "image/png" }] };
+    const du = reply.result && reply.result.dataUrl;
+    if (!du) return { content: [{ type: "text", text: "Erro: sem screenshot" }], isError: true };
+    const mime = (reply.result && reply.result.mime) || "image/png";
+    return { content: [{ type: "image", data: du.replace(/^data:image\/[a-z]+;base64,/, ""), mimeType: mime }] };
+  }
+  if (name === "browser_look") {
+    const r = reply.result || {};
+    const content = [];
+    if (r.dataUrl) content.push({ type: "image", data: r.dataUrl.replace(/^data:image\/[a-z]+;base64,/, ""), mimeType: r.mime || "image/jpeg" });
+    const map = { url: r.url, title: r.title, size: (r.width && r.height) ? (r.width + "x" + r.height) : undefined, count: r.count, elements: r.elements };
+    content.push({ type: "text", text: "Elementos numerados (o número = 'ref' para clicar/preencher, ex.: browser_click {ref:\"r3\"}):\n" + JSON.stringify(map, null, 2) });
+    return { content };
   }
   const r = reply.result;
   return { content: [{ type: "text", text: (typeof r === "string" ? r : JSON.stringify(r, null, 2)) || "(vazio)" }] };

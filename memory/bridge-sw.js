@@ -82,7 +82,7 @@
       if (!msg || !msg.cmd) return;
       let reply, tabId = null, host = "";
       try {
-        const TAB_CMDS = { read: 1, console: 1, eval: 1, screenshot: 1, click: 1, fill: 1, navigate: 1, query: 1, snapshot: 1, get_state: 1, network: 1, wait: 1, type: 1, press: 1, hover: 1, scroll: 1, select: 1, submit: 1, history: 1, login: 1, fill_secret: 1, upload: 1, move_cursor: 1, drag: 1 };
+        const TAB_CMDS = { read: 1, console: 1, eval: 1, screenshot: 1, click: 1, fill: 1, navigate: 1, query: 1, snapshot: 1, get_state: 1, network: 1, wait: 1, type: 1, press: 1, hover: 1, scroll: 1, select: 1, submit: 1, history: 1, login: 1, fill_secret: 1, upload: 1, move_cursor: 1, drag: 1, look: 1, mark: 1, inspect: 1, observe: 1 };
         const needsTab = !!TAB_CMDS[msg.cmd];
         tabId = needsTab ? await resolveTab(msg.args || {}) : null;
         if (tabId) { try { const tb = await chrome.tabs.get(tabId); host = hostOf(tb.url || ""); } catch (_) {} }
@@ -97,8 +97,8 @@
           // Trava por aba: comandos na MESMA aba serializam (evita colisão de
           // debugger/DOM entre editores); abas diferentes seguem em paralelo.
           reply = await withTabLock(tabId, () => exec(msg, tabId, host));
-          // redação: mascara segredos conhecidos em qualquer retorno textual (menos screenshot)
-          if (reply && reply.ok && reply.result !== undefined && msg.cmd !== "screenshot") reply.result = redactDeep(reply.result);
+          // redação: mascara segredos conhecidos em qualquer retorno textual (menos imagens)
+          if (reply && reply.ok && reply.result !== undefined && msg.cmd !== "screenshot" && msg.cmd !== "look") reply.result = redactDeep(reply.result);
         }
       } catch (e) {
         reply = { ok: false, error: String((e && e.message) || e) };
@@ -424,29 +424,37 @@
     });
   }
 
-  async function screenshotTab(tabId, fullPage, selector) {
+  async function screenshotTab(tabId, opts) {
     // CDP: captura mesmo em segundo plano, sem trazer a aba para frente.
+    // Barato por padrão: JPEG + qualidade + teto de resolução (downscale via clip.scale).
+    opts = opts || {};
+    const format = opts.format === "png" ? "png" : "jpeg";
+    const quality = Math.max(20, Math.min(95, opts.quality || 72));
+    const maxWidth = opts.maxWidth || 1280;
     let clip = null;
-    if (selector) {
+    if (opts.selector) {
       try {
         const [b] = await chrome.scripting.executeScript({
           target: { tabId },
           func: (sel) => { const e = document.querySelector(sel); if (!e) return null; e.scrollIntoView({ block: "center" }); const r = e.getBoundingClientRect(); return { x: r.left, y: r.top, width: r.width, height: r.height }; },
-          args: [selector],
+          args: [opts.selector],
         });
-        if (b && b.result) clip = { x: Math.max(0, b.result.x), y: Math.max(0, b.result.y), width: Math.ceil(b.result.width) || 1, height: Math.ceil(b.result.height) || 1, scale: 1 };
+        if (b && b.result) clip = { x: Math.max(0, b.result.x), y: Math.max(0, b.result.y), width: Math.ceil(b.result.width) || 1, height: Math.ceil(b.result.height) || 1 };
       } catch (_) {}
     }
     return withDebugger(tabId, async (target) => {
-      const opts = { format: "png", captureBeyondViewport: !!(fullPage || clip) };
-      if (clip) opts.clip = clip;
-      else if (fullPage) {
-        const m = await chrome.debugger.sendCommand(target, "Page.getLayoutMetrics", {});
-        const cs = (m && (m.cssContentSize || m.contentSize)) || null;
-        if (cs) opts.clip = { x: 0, y: 0, width: Math.ceil(cs.width), height: Math.ceil(cs.height), scale: 1 };
+      const m = await chrome.debugger.sendCommand(target, "Page.getLayoutMetrics", {});
+      if (!clip) {
+        if (opts.fullPage) { const cs = (m && (m.cssContentSize || m.contentSize)); if (cs) clip = { x: 0, y: 0, width: Math.ceil(cs.width), height: Math.ceil(cs.height) }; }
+        else { const vp = (m && (m.cssLayoutViewport || m.layoutViewport)); if (vp) clip = { x: 0, y: 0, width: Math.ceil(vp.clientWidth), height: Math.ceil(vp.clientHeight) }; }
       }
-      const { data } = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", opts);
-      return { dataUrl: "data:image/png;base64," + data };
+      const baseW = clip ? clip.width : 0;
+      const scale = baseW > maxWidth ? maxWidth / baseW : 1;
+      const shot = { format, captureBeyondViewport: !!(opts.fullPage || opts.selector) };
+      if (format === "jpeg") shot.quality = quality;
+      if (clip) shot.clip = { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale };
+      const { data } = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", shot);
+      return { dataUrl: "data:image/" + format + ";base64," + data, mime: "image/" + format, width: clip ? Math.round(clip.width * scale) : null, height: clip ? Math.round(clip.height * scale) : null, scale: Math.round(scale * 100) / 100 };
     });
   }
 
@@ -464,7 +472,8 @@
         if (!cur) {
           cur = document.createElement("div"); cur.id = CID;
           cur.style.cssText = "position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;transition:transform .45s cubic-bezier(.22,1,.36,1);will-change:transform;filter:drop-shadow(0 2px 4px rgba(0,0,0,.4));";
-          cur.innerHTML = '<svg width="24" height="24" viewBox="0 0 24 24" fill="#ff3b3b" stroke="#fff" stroke-width="1.5"><path d="M4 2l6.5 18 2.4-7.1L20 10.5z"/></svg>';
+          cur.innerHTML = '<svg width="24" height="24" viewBox="0 0 24 24" fill="#ff3b3b" stroke="#fff" stroke-width="1.5"><path d="M4 2l6.5 18 2.4-7.1L20 10.5z"/></svg>' +
+            '<span class="__cl_lbl" style="position:absolute;left:19px;top:6px;white-space:nowrap;background:#ff3b3b;color:#fff;font:600 11px/1.5 system-ui,sans-serif;padding:1px 7px;border-radius:7px;box-shadow:0 1px 4px rgba(0,0,0,.4);opacity:0;transition:opacity .2s;"></span>';
           document.documentElement.appendChild(cur);
         }
         if (!document.getElementById("__claudao_kf")) {
@@ -473,6 +482,21 @@
           document.documentElement.appendChild(st);
         }
         return cur;
+      }
+      function cursorLabel(text) {
+        const lbl = ensureCursor().querySelector(".__cl_lbl"); if (!lbl) return;
+        if (text) { lbl.textContent = text; lbl.style.opacity = "1"; } else { lbl.style.opacity = "0"; }
+      }
+      // Destaque momentâneo de um elemento (o usuário vê "olhando aqui").
+      function flash(el) {
+        try {
+          const r = el.getBoundingClientRect();
+          const h = document.createElement("div");
+          h.style.cssText = "position:fixed;left:" + r.left + "px;top:" + r.top + "px;width:" + r.width + "px;height:" + r.height + "px;border:2px solid #ff3b3b;border-radius:4px;background:rgba(255,59,59,.12);z-index:2147483646;pointer-events:none;transition:opacity .5s;box-sizing:border-box;";
+          document.documentElement.appendChild(h);
+          setTimeout(() => { h.style.opacity = "0"; }, 550);
+          setTimeout(() => h.remove(), 1100);
+        } catch (_) {}
       }
       function visible(el) { if (!el) return false; const r = el.getBoundingClientRect(); const cs = getComputedStyle(el); return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0"; }
       function resolveEl(a) {
@@ -514,15 +538,15 @@
       try {
         if (op === "click") {
           const el = await waitVisible(p, p.timeoutMs); if (!el) return { ok: false, error: "elemento não encontrado" };
-          const c = await moveTo(el); ripple(c.x, c.y); await sleep(110); el.click(); return { ok: true, clicked: true };
+          cursorLabel(p.label || "Clicando"); const c = await moveTo(el); ripple(c.x, c.y); await sleep(110); el.click(); cursorLabel(""); return { ok: true, clicked: true };
         }
         if (op === "fill" || op === "fill_secret") {
           const el = await waitVisible(p); if (!el) return { ok: false, error: "campo não encontrado" };
-          await moveTo(el); if (p.clearFirst) setVal(el, ""); setVal(el, p.value != null ? p.value : ""); return { ok: true, filled: true };
+          cursorLabel(op === "fill_secret" ? "Preenchendo •••" : "Preenchendo"); await moveTo(el); if (p.clearFirst) setVal(el, ""); setVal(el, p.value != null ? p.value : ""); cursorLabel(""); return { ok: true, filled: true };
         }
         if (op === "type") {
           const el = (p.selector || p.ref) ? await waitVisible(p) : document.activeElement; if (!el) return { ok: false, error: "sem elemento focado" };
-          el.focus(); for (const ch of String(p.text || "")) { setVal(el, (el.value || "") + ch); await sleep(12); } return { ok: true };
+          cursorLabel("Digitando"); el.focus(); for (const ch of String(p.text || "")) { setVal(el, (el.value || "") + ch); await sleep(12); } cursorLabel(""); return { ok: true };
         }
         if (op === "press") {
           const el = document.activeElement || document.body; const key = p.key;
@@ -532,7 +556,7 @@
         }
         if (op === "hover") {
           const el = await waitVisible(p); if (!el) return { ok: false, error: "não encontrado" };
-          const c = await moveTo(el); ["mouseover", "mouseenter", "mousemove"].forEach((t) => el.dispatchEvent(new MouseEvent(t, { bubbles: true, clientX: c.x, clientY: c.y }))); return { ok: true };
+          cursorLabel("Passando o mouse"); const c = await moveTo(el); ["mouseover", "mouseenter", "mousemove"].forEach((t) => el.dispatchEvent(new MouseEvent(t, { bubbles: true, clientX: c.x, clientY: c.y }))); cursorLabel(""); return { ok: true };
         }
         if (op === "move_cursor") {
           if (p.selector || p.ref) { const el = await waitVisible(p); if (!el) return { ok: false, error: "não encontrado" }; const c = await moveTo(el); return { ok: true, x: c.x, y: c.y }; }
@@ -549,13 +573,13 @@
           if (tx == null || ty == null) return { ok: false, error: "destino não encontrado" };
           const dt = new DataTransfer();
           const fire = (el, type, x, y) => el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt, clientX: x, clientY: y }));
-          await moveTo(src);
+          cursorLabel("Arrastando"); await moveTo(src);
           fire(src, "dragstart", sx, sy);
           const overEl = tgt || document.elementFromPoint(tx, ty) || src;
           const cur = ensureCursor(); cur.style.transform = "translate(" + tx + "px," + ty + "px)"; await sleep(320);
           fire(overEl, "dragenter", tx, ty); fire(overEl, "dragover", tx, ty); await sleep(90);
           fire(overEl, "drop", tx, ty); fire(src, "dragend", tx, ty);
-          return { ok: true, dragged: true };
+          cursorLabel(""); return { ok: true, dragged: true };
         }
         if (op === "scroll") {
           if (p.selector || p.ref) { const el = resolveEl(p); if (el) el.scrollIntoView({ behavior: "smooth", block: "center" }); }
@@ -617,6 +641,7 @@
         if (op === "login") {
           const pass = document.querySelector('input[type="password"]:not([disabled])');
           if (!pass) return { ok: false, error: "campo de senha não encontrado — a aba está na tela de login?" };
+          cursorLabel("Entrando");
           const form = pass.closest("form"), scope = form || document;
           const cands = [...scope.querySelectorAll('input[type="email"],input[type="text"],input[type="tel"],input:not([type])')].filter((i) => i !== pass && visible(i));
           const user = cands.find((i) => /user|email|login|mail|cpf|phone|usuario/i.test((i.name || "") + (i.id || "") + (i.autocomplete || "") + (i.getAttribute("aria-label") || ""))) || cands[cands.length - 1] || cands[0];
@@ -628,7 +653,68 @@
             if (btn) { const c = await moveTo(btn); ripple(c.x, c.y); await sleep(100); btn.click(); submitted = true; }
             else if (form) { form.requestSubmit ? form.requestSubmit() : form.submit(); submitted = true; }
           }
-          return { ok: true, submitted, filledUser: !!user, beforeUrl };
+          cursorLabel(""); return { ok: true, submitted, filledUser: !!user, beforeUrl };
+        }
+        if (op === "mark" || op === "unmark") {
+          // Set-of-marks: desenha números nos elementos interativos e devolve o mapa
+          // número→ref. Os badges aparecem na screenshot (o modelo vê) E na tela (você vê).
+          const CMK = "__claudao_marks__";
+          const old = document.getElementById(CMK); if (old) old.remove();
+          if (op === "unmark") return { ok: true, unmarked: true };
+          const box = document.createElement("div"); box.id = CMK;
+          box.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483646;";
+          document.documentElement.appendChild(box);
+          const sel = "a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem],[role=switch],[role=radio],[onclick],[contenteditable=true],[tabindex]";
+          const seen = new Set();
+          const els = [...document.querySelectorAll(sel)].filter((e) => visible(e) && !seen.has(e) && seen.add(e)).slice(0, p.limit || 100);
+          let i = 0; const out = [];
+          for (const e of els) {
+            const ref = "r" + (++i); e.setAttribute("data-cm-ref", ref);
+            const r = e.getBoundingClientRect();
+            const label = (e.getAttribute("aria-label") || e.placeholder || e.value || (e.textContent || "").trim() || e.name || "").replace(/\s+/g, " ").trim().slice(0, 60);
+            const role = e.getAttribute("role") || ({ A: "link", BUTTON: "button", INPUT: (e.type || "text"), SELECT: "select", TEXTAREA: "textbox" }[e.tagName] || e.tagName.toLowerCase());
+            const ol = document.createElement("div");
+            ol.style.cssText = "position:fixed;left:" + r.left + "px;top:" + r.top + "px;width:" + r.width + "px;height:" + r.height + "px;border:1.5px solid rgba(255,59,59,.55);border-radius:3px;box-sizing:border-box;pointer-events:none;";
+            const badge = document.createElement("div"); badge.textContent = i;
+            badge.style.cssText = "position:fixed;left:" + Math.max(0, r.left) + "px;top:" + Math.max(0, r.top) + "px;transform:translate(-1px,-1px);background:#ff3b3b;color:#fff;font:700 11px/1.35 system-ui,sans-serif;padding:0 4px;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,.5);pointer-events:none;";
+            box.appendChild(ol); box.appendChild(badge);
+            out.push({ ref, mark: i, role, label, x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) });
+          }
+          return { ok: true, url: location.href, title: document.title, count: out.length, elements: out };
+        }
+        if (op === "inspect") {
+          const el = resolveEl(p); if (!el) return { ok: false, error: "elemento não encontrado" };
+          flash(el);
+          const r = el.getBoundingClientRect(); const cs = getComputedStyle(el);
+          const attrs = {}; for (const at of el.attributes) attrs[at.name] = at.value;
+          const styles = {}; for (const k of ["display", "position", "color", "backgroundColor", "fontSize", "fontWeight", "zIndex", "opacity", "visibility", "border", "margin", "padding", "width", "height", "overflow"]) styles[k] = cs[k];
+          return { ok: true, tag: el.tagName.toLowerCase(), text: (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 300), value: el.value, visible: visible(el), disabled: !!el.disabled,
+            bbox: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }, attrs, styles,
+            a11y: { role: el.getAttribute("role") || null, ariaLabel: el.getAttribute("aria-label") || null, name: el.getAttribute("name") || null, tabindex: el.getAttribute("tabindex") || null },
+            html: el.outerHTML.slice(0, 900) };
+        }
+        if (op === "observe") {
+          // Diff de DOM: só o que mudou desde a última observação (loop de ajuste ágil).
+          const KEY = "__claudaoObs";
+          if (p.reset || !window[KEY]) {
+            try { if (window[KEY] && window[KEY].mo) window[KEY].mo.disconnect(); } catch (_) {}
+            const state = { changes: [] };
+            const mo = new MutationObserver((muts) => {
+              for (const m of muts) {
+                if (m.type === "childList") {
+                  for (const n of m.addedNodes) if (n.nodeType === 1) state.changes.push({ t: "add", tag: n.tagName.toLowerCase(), text: (n.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80) });
+                  for (const n of m.removedNodes) if (n.nodeType === 1) state.changes.push({ t: "remove", tag: n.tagName.toLowerCase(), text: (n.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80) });
+                } else if (m.type === "attributes") { state.changes.push({ t: "attr", tag: m.target.tagName && m.target.tagName.toLowerCase(), attr: m.attributeName }); }
+                else if (m.type === "characterData") { state.changes.push({ t: "text", text: (m.target.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80) }); }
+                if (state.changes.length > 500) state.changes.shift();
+              }
+            });
+            try { mo.observe(document.body || document.documentElement, { childList: true, subtree: true, attributes: true, characterData: true }); } catch (_) {}
+            state.mo = mo; window[KEY] = state;
+            return { ok: true, started: true, changes: [], count: 0 };
+          }
+          const st = window[KEY]; const out = st.changes.slice(0, p.limit || 120); st.changes = [];
+          return { ok: true, changes: out, count: out.length };
         }
         return { ok: false, error: "op desconhecida: " + op };
       } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
@@ -701,7 +787,19 @@
         return { ok: true, result: r ? r.result : [] };
       }
       case "eval": { if (!a.code) throw new Error("faltou 'code'"); return { ok: true, result: await evalInTab(tabId, a.code) }; }
-      case "screenshot": { return { ok: true, result: await screenshotTab(tabId, !!a.fullPage, a.selector) }; }
+      case "screenshot": { return { ok: true, result: await screenshotTab(tabId, { fullPage: a.fullPage, selector: a.selector, maxWidth: a.maxWidth, format: a.format, quality: a.quality }) }; }
+      case "look": {
+        // Set-of-marks: marca os elementos, tira a foto (leve) com os números, devolve foto + mapa.
+        const map = await agentExec(tabId, { op: "mark", limit: a.limit });
+        if (!map || !map.ok) return { ok: false, error: (map && map.error) || "falha ao marcar" };
+        await new Promise((r) => setTimeout(r, 160)); // deixa os badges pintarem antes da captura
+        const shot = await screenshotTab(tabId, { maxWidth: a.maxWidth, format: a.format || "jpeg", quality: a.quality });
+        setTimeout(() => { agentExec(tabId, { op: "unmark" }).catch(() => {}); }, a.keepMarks ? 4000 : 900);
+        return { ok: true, result: { look: true, url: map.url, title: map.title, dataUrl: shot.dataUrl, mime: shot.mime, width: shot.width, height: shot.height, count: map.count, elements: map.elements } };
+      }
+      case "mark": { const r = await agentExec(tabId, { op: a.clear ? "unmark" : "mark", limit: a.limit }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error }; }
+      case "inspect": { const r = await agentExec(tabId, { op: "inspect", selector: a.selector, ref: a.ref, text: a.text }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error }; }
+      case "observe": { const r = await agentExec(tabId, { op: "observe", reset: a.reset, limit: a.limit }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error }; }
 
       // --- Ação (via agente de página, com cursor) ---
       case "click": {
