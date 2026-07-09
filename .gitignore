@@ -1,0 +1,16 @@
+# Sistema operacional
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editores
+.vscode/
+.idea/
+*.swp
+
+# Dependências / build (não deveria existir aqui — a ponte é zero-dep)
+node_modules/
+
+# Temporários / logs
+*.log
+*.tmp
