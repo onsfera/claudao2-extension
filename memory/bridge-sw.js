@@ -97,8 +97,16 @@
           // Trava por aba: comandos na MESMA aba serializam (evita colisão de
           // debugger/DOM entre editores); abas diferentes seguem em paralelo.
           reply = await withTabLock(tabId, () => exec(msg, tabId, host));
-          // redação: mascara segredos conhecidos em qualquer retorno textual (menos imagens)
-          if (reply && reply.ok && reply.result !== undefined && msg.cmd !== "screenshot" && msg.cmd !== "look") reply.result = redactDeep(reply.result);
+          // redação: mascara segredos conhecidos em qualquer retorno textual. No look,
+          // redige o texto (elements/url/title) mas preserva o dataUrl (não varre o base64).
+          if (reply && reply.ok && reply.result !== undefined && msg.cmd !== "screenshot") {
+            if (msg.cmd === "look" && reply.result && reply.result.dataUrl) {
+              const du = reply.result.dataUrl; reply.result.dataUrl = null;
+              reply.result = redactDeep(reply.result); reply.result.dataUrl = du;
+            } else {
+              reply.result = redactDeep(reply.result);
+            }
+          }
         }
       } catch (e) {
         reply = { ok: false, error: String((e && e.message) || e) };
@@ -426,35 +434,46 @@
 
   async function screenshotTab(tabId, opts) {
     // CDP: captura mesmo em segundo plano, sem trazer a aba para frente.
-    // Barato por padrão: JPEG + qualidade + teto de resolução (downscale via clip.scale).
+    // Barato por padrão: JPEG + qualidade + teto de resolução (downscale via clip.scale),
+    // considerando o devicePixelRatio para o teto valer em PIXELS FÍSICOS.
     opts = opts || {};
     const format = opts.format === "png" ? "png" : "jpeg";
     const quality = Math.max(20, Math.min(95, opts.quality || 72));
     const maxWidth = opts.maxWidth || 1280;
-    let clip = null;
-    if (opts.selector) {
-      try {
-        const [b] = await chrome.scripting.executeScript({
-          target: { tabId },
-          func: (sel) => { const e = document.querySelector(sel); if (!e) return null; e.scrollIntoView({ block: "center" }); const r = e.getBoundingClientRect(); return { x: r.left, y: r.top, width: r.width, height: r.height }; },
-          args: [opts.selector],
-        });
-        if (b && b.result) clip = { x: Math.max(0, b.result.x), y: Math.max(0, b.result.y), width: Math.ceil(b.result.width) || 1, height: Math.ceil(b.result.height) || 1 };
-      } catch (_) {}
-    }
+    // Uma injeção pega o DPR e, se houver selector, rola o elemento à vista e mede (viewport-relativo).
+    let info = { dpr: 1, rect: null };
+    try {
+      const [b] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (sel) => {
+          let rect = null;
+          if (sel) { const e = document.querySelector(sel); if (e) { e.scrollIntoView({ block: "center" }); const r = e.getBoundingClientRect(); rect = { x: r.left, y: r.top, width: r.width, height: r.height }; } }
+          return { dpr: window.devicePixelRatio || 1, rect };
+        },
+        args: [opts.selector || ""],
+      });
+      if (b && b.result) info = b.result;
+    } catch (_) {}
     return withDebugger(tabId, async (target) => {
       const m = await chrome.debugger.sendCommand(target, "Page.getLayoutMetrics", {});
-      if (!clip) {
-        if (opts.fullPage) { const cs = (m && (m.cssContentSize || m.contentSize)); if (cs) clip = { x: 0, y: 0, width: Math.ceil(cs.width), height: Math.ceil(cs.height) }; }
-        else { const vp = (m && (m.cssLayoutViewport || m.layoutViewport)); if (vp) clip = { x: 0, y: 0, width: Math.ceil(vp.clientWidth), height: Math.ceil(vp.clientHeight) }; }
+      let clip = null, beyond = false;
+      if (opts.selector && info.rect) {
+        // Elemento já rolado à vista → clip viewport-relativo, sem captureBeyondViewport.
+        clip = { x: Math.max(0, info.rect.x), y: Math.max(0, info.rect.y), width: Math.ceil(info.rect.width) || 1, height: Math.ceil(info.rect.height) || 1 }; beyond = false;
+      } else if (opts.fullPage) {
+        const cs = (m && (m.cssContentSize || m.contentSize)); if (cs) clip = { x: 0, y: 0, width: Math.ceil(cs.width), height: Math.ceil(cs.height) }; beyond = true;
+      } else {
+        const vp = (m && (m.cssLayoutViewport || m.layoutViewport)); if (vp) clip = { x: 0, y: 0, width: Math.ceil(vp.clientWidth), height: Math.ceil(vp.clientHeight) }; beyond = false;
       }
+      const dpr = info.dpr || 1;
       const baseW = clip ? clip.width : 0;
-      const scale = baseW > maxWidth ? maxWidth / baseW : 1;
-      const shot = { format, captureBeyondViewport: !!(opts.fullPage || opts.selector) };
+      // físico = baseW * dpr * scale ; cap em maxWidth (nunca ampliar)
+      const scale = baseW ? Math.min(1, maxWidth / (baseW * dpr)) : 1;
+      const shot = { format, captureBeyondViewport: beyond };
       if (format === "jpeg") shot.quality = quality;
       if (clip) shot.clip = { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale };
       const { data } = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", shot);
-      return { dataUrl: "data:image/" + format + ";base64," + data, mime: "image/" + format, width: clip ? Math.round(clip.width * scale) : null, height: clip ? Math.round(clip.height * scale) : null, scale: Math.round(scale * 100) / 100 };
+      return { dataUrl: "data:image/" + format + ";base64," + data, mime: "image/" + format, width: clip ? Math.round(clip.width * scale * dpr) : null, height: clip ? Math.round(clip.height * scale * dpr) : null, scale: Math.round(scale * 100) / 100 };
     });
   }
 
@@ -605,9 +624,10 @@
           return { ok: true, count: els.length, elements: els.map((e) => { const r = e.getBoundingClientRect(); const attrs = {}; for (const at of e.attributes) attrs[at.name] = at.value; return { tag: e.tagName.toLowerCase(), text: (e.textContent || "").trim().slice(0, 200), value: e.value, visible: visible(e), disabled: !!e.disabled, bbox: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }, attrs }; }) };
         }
         if (op === "snapshot") {
+          document.querySelectorAll("[data-cm-ref]").forEach((e) => e.removeAttribute("data-cm-ref"));
           const sel = "a[href],button,input,select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem],[onclick],[tabindex]";
           const els = [...document.querySelectorAll(sel)].filter(visible).slice(0, 120);
-          let i = 0; const out = els.map((e) => { const ref = "r" + (++i); e.setAttribute("data-cm-ref", ref); const r = e.getBoundingClientRect(); const label = (e.getAttribute("aria-label") || e.placeholder || e.value || (e.textContent || "").trim() || e.name || "").trim().slice(0, 70); const role = e.getAttribute("role") || ({ A: "link", BUTTON: "button", INPUT: (e.type || "text"), SELECT: "select", TEXTAREA: "textbox" }[e.tagName] || e.tagName.toLowerCase()); return { ref, role, label, x: Math.round(r.x), y: Math.round(r.y) }; });
+          let i = 0; const out = els.map((e) => { const ref = "r" + (++i); e.setAttribute("data-cm-ref", ref); const r = e.getBoundingClientRect(); const label = (e.getAttribute("aria-label") || e.placeholder || (e.type === "password" ? "" : e.value) || (e.textContent || "").trim() || e.name || "").trim().slice(0, 70); const role = e.getAttribute("role") || ({ A: "link", BUTTON: "button", INPUT: (e.type || "text"), SELECT: "select", TEXTAREA: "textbox" }[e.tagName] || e.tagName.toLowerCase()); return { ref, role, label, x: Math.round(r.x), y: Math.round(r.y) }; });
           return { ok: true, url: location.href, title: document.title, elements: out };
         }
         if (op === "get_state") {
@@ -660,18 +680,23 @@
           // número→ref. Os badges aparecem na screenshot (o modelo vê) E na tela (você vê).
           const CMK = "__claudao_marks__";
           const old = document.getElementById(CMK); if (old) old.remove();
+          // limpa refs obsoletos de marcações anteriores (evita ref antigo colar em elemento errado)
+          document.querySelectorAll("[data-cm-ref]").forEach((e) => e.removeAttribute("data-cm-ref"));
           if (op === "unmark") return { ok: true, unmarked: true };
           const box = document.createElement("div"); box.id = CMK;
           box.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483646;";
           document.documentElement.appendChild(box);
           const sel = "a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem],[role=switch],[role=radio],[onclick],[contenteditable=true],[tabindex]";
+          // só elementos DENTRO da dobra (o badge é fixed no viewport e a foto do look é do viewport)
+          const inVp = (e) => { const r = e.getBoundingClientRect(); return r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth; };
           const seen = new Set();
-          const els = [...document.querySelectorAll(sel)].filter((e) => visible(e) && !seen.has(e) && seen.add(e)).slice(0, p.limit || 100);
+          const els = [...document.querySelectorAll(sel)].filter((e) => visible(e) && inVp(e) && !seen.has(e) && seen.add(e)).slice(0, p.limit || 100);
           let i = 0; const out = [];
           for (const e of els) {
             const ref = "r" + (++i); e.setAttribute("data-cm-ref", ref);
             const r = e.getBoundingClientRect();
-            const label = (e.getAttribute("aria-label") || e.placeholder || e.value || (e.textContent || "").trim() || e.name || "").replace(/\s+/g, " ").trim().slice(0, 60);
+            const val = e.type === "password" ? "" : e.value; // nunca expor senha no rótulo
+            const label = (e.getAttribute("aria-label") || e.placeholder || val || (e.textContent || "").trim() || e.name || "").replace(/\s+/g, " ").trim().slice(0, 60);
             const role = e.getAttribute("role") || ({ A: "link", BUTTON: "button", INPUT: (e.type || "text"), SELECT: "select", TEXTAREA: "textbox" }[e.tagName] || e.tagName.toLowerCase());
             const ol = document.createElement("div");
             ol.style.cssText = "position:fixed;left:" + r.left + "px;top:" + r.top + "px;width:" + r.width + "px;height:" + r.height + "px;border:1.5px solid rgba(255,59,59,.55);border-radius:3px;box-sizing:border-box;pointer-events:none;";
@@ -696,28 +721,35 @@
         if (op === "observe") {
           // Diff de DOM: só o que mudou desde a última observação (loop de ajuste ágil).
           const KEY = "__claudaoObs";
+          if (p.stop) { try { if (window[KEY] && window[KEY].mo) window[KEY].mo.disconnect(); } catch (_) {} window[KEY] = null; return { ok: true, stopped: true }; }
           if (p.reset || !window[KEY]) {
             try { if (window[KEY] && window[KEY].mo) window[KEY].mo.disconnect(); } catch (_) {}
             const state = { changes: [] };
+            const own = (n) => !!(n && n.nodeType === 1 && ((n.id && String(n.id).indexOf("__claudao") === 0) || (n.closest && n.closest("#__claudao_marks__,#__claudao_glow__,#__claudao_cursor__"))));
             const mo = new MutationObserver((muts) => {
               for (const m of muts) {
+                if (m.type === "attributes" && m.attributeName === "data-cm-ref") continue; // ruído da própria extensão
+                if (own(m.target)) continue;
                 if (m.type === "childList") {
-                  for (const n of m.addedNodes) if (n.nodeType === 1) state.changes.push({ t: "add", tag: n.tagName.toLowerCase(), text: (n.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80) });
-                  for (const n of m.removedNodes) if (n.nodeType === 1) state.changes.push({ t: "remove", tag: n.tagName.toLowerCase(), text: (n.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80) });
+                  for (const n of m.addedNodes) if (n.nodeType === 1 && !own(n)) state.changes.push({ t: "add", tag: n.tagName.toLowerCase(), text: (n.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80) });
+                  for (const n of m.removedNodes) if (n.nodeType === 1 && !own(n)) state.changes.push({ t: "remove", tag: n.tagName.toLowerCase(), text: (n.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80) });
                 } else if (m.type === "attributes") { state.changes.push({ t: "attr", tag: m.target.tagName && m.target.tagName.toLowerCase(), attr: m.attributeName }); }
                 else if (m.type === "characterData") { state.changes.push({ t: "text", text: (m.target.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80) }); }
-                if (state.changes.length > 500) state.changes.shift();
+                if (state.changes.length > 800) state.changes.shift();
               }
             });
             try { mo.observe(document.body || document.documentElement, { childList: true, subtree: true, attributes: true, characterData: true }); } catch (_) {}
             state.mo = mo; window[KEY] = state;
             return { ok: true, started: true, changes: [], count: 0 };
           }
-          const st = window[KEY]; const out = st.changes.slice(0, p.limit || 120); st.changes = [];
-          return { ok: true, changes: out, count: out.length };
+          const st = window[KEY]; const lim = p.limit || 120;
+          const out = st.changes.slice(-lim); // as MAIS NOVAS
+          const dropped = Math.max(0, st.changes.length - out.length);
+          st.changes = [];
+          return { ok: true, changes: out, count: out.length, dropped };
         }
         return { ok: false, error: "op desconhecida: " + op };
-      } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+      } catch (e) { try { cursorLabel(""); } catch (_) {} return { ok: false, error: String((e && e.message) || e) }; }
     })();
   }
 
