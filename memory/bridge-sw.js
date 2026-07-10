@@ -40,6 +40,7 @@
   const ALLOWALL_KEY = "cm_bridge_allow_all"; // aprovar tudo automaticamente (padrão: sim)
   const EXTRELOAD_KEY = "cm_allow_ext_reload"; // deixar o Claude externo recarregar a extensão (padrão: sim)
   const VAULT_KEY = "cm_vault";             // credenciais do cofre {items:[{id,domain,name,username,value}]}
+  const PAUSE_KEY = "cm_external_paused";   // "Parar Claude": recusa comandos até retomar
   const DEFAULT_ALLOW = ["localhost", "127.0.0.1"];
   const ACTIVE_IDLE_MS = 12000;             // trava/banner só somem após esse ocioso (evita piscar entre comandos)
   // Comandos que MODIFICAM/interagem (exigem domínio aprovado). Percepção é livre.
@@ -80,6 +81,11 @@
         return;
       }
       if (!msg || !msg.cmd) return;
+      // "Parar Claude": se o usuário pausou (botão na tela ou assumiu o controle), recusa tudo.
+      if (await isPaused()) {
+        try { ws.send(JSON.stringify({ id: msg.id, ok: false, paused: true, error: "Interação PAUSADA pelo usuário (Parar Claude / assumiu o controle). Aguarde ele retomar no painel do Claudão² antes de continuar." })); } catch (_) {}
+        return;
+      }
       let reply, tabId = null, host = "";
       try {
         const TAB_CMDS = { read: 1, console: 1, eval: 1, screenshot: 1, click: 1, fill: 1, navigate: 1, query: 1, snapshot: 1, get_state: 1, network: 1, wait: 1, type: 1, press: 1, hover: 1, scroll: 1, select: 1, submit: 1, history: 1, login: 1, fill_secret: 1, upload: 1, move_cursor: 1, drag: 1, look: 1, mark: 1, inspect: 1, observe: 1 };
@@ -143,6 +149,12 @@
     if (changes[GRANT_KEY] && changes[GRANT_KEY].newValue) {
       const g = changes[GRANT_KEY].newValue;
       if (g && g.host && g.scope === "session") sessionConsent.add(g.host);
+    }
+    // "Parar Claude": ao pausar, limpa o glow/cursor de TODAS as abas e zera a atividade.
+    if (changes[PAUSE_KEY] && changes[PAUSE_KEY].newValue && changes[PAUSE_KEY].newValue.on) {
+      clearTimeout(clearTimer);
+      unglowAll();
+      try { chrome.storage.local.set({ [ACTIVE_KEY]: { active: false, ts: Date.now() } }); } catch (_) {}
     }
   });
 
@@ -343,15 +355,21 @@
   // -------------------------------------------------------------------------
   // Atividade externa: glow na página + flag para o sidepanel
   // -------------------------------------------------------------------------
-  let activeTab = null;
+  const glowedTabs = new Set(); // TODAS as abas com glow (não uma só) — apaga todas ao encerrar
   let clearTimer = null;
+  const GLOW_TTL_MS = 15000;    // overlay se auto-remove se não renovado (sobrevive à morte do SW)
+
+  async function isPaused() {
+    try { const v = (await chrome.storage.local.get(PAUSE_KEY))[PAUSE_KEY]; return !!(v && v.on); } catch (_) { return false; }
+  }
+  function unglowAll() { for (const t of glowedTabs) glow(t, false); glowedTabs.clear(); }
 
   async function markActive(client, tabId) {
-    activeTab = tabId || activeTab;
+    if (tabId) glowedTabs.add(tabId);
     try {
       await chrome.storage.local.set({ [ACTIVE_KEY]: { active: true, client: client || "Claude externo", tab: tabId || null, ts: Date.now() } });
     } catch (_) {}
-    if (tabId) glow(tabId, true);
+    if (tabId) glow(tabId, true, client);
     clearTimeout(clearTimer);
     clearTimer = setTimeout(clearActive, ACTIVE_IDLE_MS);
   }
@@ -365,35 +383,59 @@
       }
       await chrome.storage.local.set({ [ACTIVE_KEY]: { active: false, ts: Date.now() } });
     } catch (_) {}
-    if (activeTab) glow(activeTab, false);
-    activeTab = null;
+    unglowAll();
   }
 
-  async function glow(tabId, on) {
+  // Injeta na aba: borda neon + botão "Parar Claude" + auto-pausa se o usuário mexer.
+  // O overlay renova um timestamp e se remove sozinho se não for renovado (backstop
+  // contra o service worker dormir). glowedTabs garante a limpeza multi-aba explícita.
+  async function glow(tabId, on, client) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
-        func: (show) => {
-          const ID = "__claudao_glow__";
-          const el = document.getElementById(ID);
+        func: (show, label, ttl, pauseKey) => {
+          const IDS = ["__claudao_glow__", "__claudao_cursor__", "__claudao_marks__", "__claudao_stop__"];
           if (!show) {
-            if (el) el.remove();
-            const cur = document.getElementById("__claudao_cursor__");
-            if (cur) cur.remove();
+            IDS.forEach((id) => { const e = document.getElementById(id); if (e) e.remove(); });
+            if (window.__claudaoGlowInt) { clearInterval(window.__claudaoGlowInt); window.__claudaoGlowInt = null; }
             return;
           }
-          if (el) return;
-          const d = document.createElement("div");
-          d.id = ID;
-          d.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483647;" +
-            "box-shadow:inset 0 0 0 3px rgba(255,64,64,.95), inset 0 0 42px rgba(255,64,64,.5);" +
-            "animation:__claudaoGlow 1.6s ease-in-out infinite;";
-          const s = document.createElement("style");
-          s.textContent = "@keyframes __claudaoGlow{0%,100%{opacity:.55}50%{opacity:1}}";
-          d.appendChild(s);
-          (document.body || document.documentElement).appendChild(d);
+          window.__claudaoGlowTs = Date.now(); // renova (mantém vivo)
+          if (!document.getElementById("__claudao_glow__")) {
+            const d = document.createElement("div"); d.id = "__claudao_glow__";
+            d.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483646;box-shadow:inset 0 0 0 3px rgba(255,64,64,.95), inset 0 0 42px rgba(255,64,64,.5);animation:__claudaoGlow 1.6s ease-in-out infinite;";
+            const s = document.createElement("style"); s.textContent = "@keyframes __claudaoGlow{0%,100%{opacity:.55}50%{opacity:1}}";
+            d.appendChild(s); (document.body || document.documentElement).appendChild(d);
+          }
+          if (!document.getElementById("__claudao_stop__")) {
+            const btn = document.createElement("button"); btn.id = "__claudao_stop__";
+            btn.innerHTML = "⏹ Parar Claude" + (label ? " <span style='opacity:.7;font-weight:400'>· " + String(label).slice(0, 24) + "</span>" : "");
+            btn.style.cssText = "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#c0392b;color:#fff;border:none;border-radius:9px;padding:8px 16px;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 3px 14px rgba(0,0,0,.45);pointer-events:auto;";
+            btn.onclick = (e) => { e.stopPropagation(); try { chrome.storage.local.set({ [pauseKey]: { on: true, ts: Date.now(), reason: "button" } }); } catch (_) {} btn.textContent = "Pausado"; btn.style.background = "#7a1f1f"; };
+            (document.body || document.documentElement).appendChild(btn);
+          }
+          if (!window.__claudaoGlowInt) {
+            window.__claudaoGlowInt = setInterval(() => {
+              if (Date.now() - (window.__claudaoGlowTs || 0) > (ttl || 15000)) {
+                IDS.forEach((id) => { const e = document.getElementById(id); if (e) e.remove(); });
+                clearInterval(window.__claudaoGlowInt); window.__claudaoGlowInt = null;
+              }
+            }, 3000);
+          }
+          // auto-pausa: input REAL do usuário com glow ativo = "assumi o controle"
+          if (!window.__claudaoTakeoverBound) {
+            window.__claudaoTakeoverBound = true;
+            const onUser = (ev) => {
+              if (!ev.isTrusted) return;
+              if (ev.target && ev.target.id === "__claudao_stop__") return; // o botão já pausa
+              if (!document.getElementById("__claudao_glow__")) return;      // só com glow ativo
+              try { chrome.storage.local.set({ [pauseKey]: { on: true, ts: Date.now(), reason: "takeover" } }); } catch (_) {}
+            };
+            addEventListener("mousedown", onUser, true);
+            addEventListener("keydown", onUser, true);
+          }
         },
-        args: [!!on],
+        args: [!!on, client || "", GLOW_TTL_MS, PAUSE_KEY],
       });
     } catch (_) {}
   }

@@ -23,6 +23,7 @@
   const INSTA_URL = "https://www.instagram.com/ujamatef/";
   const ONSFERA_URL = "https://onsfera.com";
   const ACTIVE_KEY = "cm_external_active";
+  const PAUSE_KEY = "cm_external_paused";
   const STATUS_KEY = "cm_bridge_status";
   const ENABLED_KEY = "cm_bridge_enabled";
   const LOG_KEY = "cm_bridge_log";          // log de ações (auditoria)
@@ -181,6 +182,7 @@
   const EXTRA2 = {
     pt: {
       security: "Segurança", vault: "Cofre",
+      paused_by_you: "Claude pausado por você", resume: "Retomar",
       auto_approve: "Aprovar tudo automaticamente", auto_approve_hint: "Ligado: o Claude externo age em qualquer site sem pedir. Desligue para exigir aprovação por domínio (a lista abaixo passa a valer).",
       t_autoapprove_on: "Aprovação automática ligada.", t_autoapprove_off: "Aprovação automática desligada — a allowlist agora vale.",
       ext_reload: "Permitir recarregar a extensão", ext_reload_hint: "Deixa o Claude externo recarregar o Claudão² (pega edições de código sem abrir chrome://extensions).",
@@ -197,6 +199,7 @@
     },
     en: {
       security: "Security", vault: "Vault",
+      paused_by_you: "Claude paused by you", resume: "Resume",
       auto_approve: "Auto-approve everything", auto_approve_hint: "On: external Claude acts on any site without asking. Turn off to require per-domain approval (the list below then applies).",
       t_autoapprove_on: "Auto-approve on.", t_autoapprove_off: "Auto-approve off — the allowlist now applies.",
       ext_reload: "Allow reloading the extension", ext_reload_hint: "Lets external Claude reload Claudão² (picks up code edits without opening chrome://extensions).",
@@ -213,6 +216,7 @@
     },
     es: {
       security: "Seguridad", vault: "Bóveda",
+      paused_by_you: "Claude pausado por ti", resume: "Reanudar",
       auto_approve: "Aprobar todo automáticamente", auto_approve_hint: "Activado: el Claude externo actúa en cualquier sitio sin pedir. Desactívalo para exigir aprobación por dominio (la lista de abajo pasa a valer).",
       t_autoapprove_on: "Aprobación automática activada.", t_autoapprove_off: "Aprobación automática desactivada — la lista ahora vale.",
       ext_reload: "Permitir recargar la extensión", ext_reload_hint: "Deja que el Claude externo recargue Claudão² (toma cambios de código sin abrir chrome://extensions).",
@@ -250,6 +254,7 @@
       if (panel && panel.style.display !== "none" && $("#cm-screen-list") && $("#cm-screen-list").style.display !== "none") refreshList();
     }
     if (changes[ACTIVE_KEY]) applyExternalState(changes[ACTIVE_KEY].newValue);
+    if (changes[PAUSE_KEY]) applyPaused(changes[PAUSE_KEY].newValue);
     if (changes[STATUS_KEY] || changes[ENABLED_KEY] || changes[PATHS_KEY]) refreshConnect();
     if (changes[CONSENT_KEY]) applyConsent(changes[CONSENT_KEY].newValue);
     if ((changes[LOG_KEY] || changes[ALLOW_KEY]) && curScreen === "security") refreshSecurity();
@@ -1048,6 +1053,22 @@
     const lock = h("div", { id: "cm-extlock", style: "display:none" });
     lock.innerHTML = "<span>" + ico("cpu", 15) + " " + t("ext_waiting") + "</span>";
     shadow.appendChild(lock);
+    const pause = h("div", { id: "cm-pausebar", style: "display:none" });
+    pause.innerHTML = "<span>⏸ " + t("paused_by_you") + "</span>";
+    const resume = h("button", { className: "cm-pause-resume", textContent: t("resume") });
+    resume.addEventListener("click", () => { try { chrome.storage.local.set({ [PAUSE_KEY]: { on: false, ts: Date.now() } }); } catch (_) {} });
+    pause.appendChild(resume);
+    shadow.appendChild(pause);
+  }
+  function applyPaused(st) {
+    if (!IS_SIDEPANEL || !shadow) return;
+    ensureExternalUI();
+    const bar = shadow.getElementById("cm-pausebar");
+    if (bar) bar.style.display = (st && st.on) ? "flex" : "none";
+  }
+  async function pollPaused() {
+    if (!IS_SIDEPANEL) return;
+    try { applyPaused((await chrome.storage.local.get(PAUSE_KEY))[PAUSE_KEY]); } catch (_) {}
   }
   function positionLock(lock) {
     const el = getComposer();
@@ -1340,7 +1361,7 @@
     buildUI();
     loadSettings().finally(startObservers);
     maybeShowAttribution();
-    if (IS_SIDEPANEL) { ensureExternalUI(); ensureConsentUI(); pollExternal(); pollConsent(); refreshConnect(); setInterval(() => { pollExternal(); pollConsent(); }, 2500); }
+    if (IS_SIDEPANEL) { ensureExternalUI(); ensureConsentUI(); pollExternal(); pollConsent(); pollPaused(); refreshConnect(); setInterval(() => { pollExternal(); pollConsent(); pollPaused(); }, 2500); }
   }
 
   // ---------------------------------------------------------------------------
@@ -1597,6 +1618,11 @@
       font-weight: 500; text-align: center; line-height: 1.35; box-shadow: 0 2px 12px rgba(0,0,0,.4); }
     #cm-extbar strong { color: #fff; white-space: nowrap; }
     #cm-extbar .lucide { vertical-align: -2px; margin-right: 3px; }
+    #cm-pausebar { position: fixed; top: 0; left: 0; right: 0; z-index: 44; padding: 9px 16px;
+      background: #7a1f1f; color: #ffe9e9; font-family: system-ui, sans-serif; font-size: 12.5px; font-weight: 600;
+      display: flex; align-items: center; justify-content: center; gap: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.4); }
+    .cm-pause-resume { background: #fff; color: #7a1f1f; border: none; border-radius: 7px; padding: 5px 14px; font: 600 12px system-ui, sans-serif; cursor: pointer; }
+    .cm-pause-resume:hover { background: #ffe9e9; }
     #cm-extlock { position: fixed; z-index: 41; background: var(--overlay); backdrop-filter: blur(1.5px);
       display: flex; align-items: flex-start; justify-content: center; padding-top: 16px; }
     #cm-extlock span { display: inline-flex; align-items: center; gap: 7px; background: var(--head); color: #ffb4b4;
