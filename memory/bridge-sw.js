@@ -84,9 +84,13 @@
       }
       if (!msg || !msg.cmd) return;
       // "Parar Claude": se o usuário pausou (botão na tela ou assumiu o controle), recusa tudo.
-      if (await isPaused()) {
-        try { ws.send(JSON.stringify({ id: msg.id, ok: false, paused: true, error: "Interação PAUSADA pelo usuário (Parar Claude / assumiu o controle). Aguarde ele retomar no painel do Claudão² antes de continuar." })); } catch (_) {}
-        return;
+      {
+        let pv = null; try { pv = (await chrome.storage.local.get(PAUSE_KEY))[PAUSE_KEY]; } catch (_) {}
+        if (pv && pv.on) {
+          const why = pv.reason === "takeover" ? "O usuário ASSUMIU o controle (mexeu na página)" : "O usuário clicou em PARAR CLAUDE";
+          try { ws.send(JSON.stringify({ id: msg.id, ok: false, paused: true, error: why + ". A interação está PAUSADA por decisão do usuário. PARE agora: NÃO repita a chamada automaticamente. Pergunte a ele o que ajustar, ou espere ele clicar em Retomar (na página ou no painel)." })); } catch (_) {}
+          return;
+        }
       }
       let reply, tabId = null, host = "";
       try {
@@ -152,11 +156,19 @@
       const g = changes[GRANT_KEY].newValue;
       if (g && g.host && g.scope === "session") sessionConsent.add(g.host);
     }
-    // "Parar Claude": ao pausar, limpa o glow/cursor de TODAS as abas e zera a atividade.
-    if (changes[PAUSE_KEY] && changes[PAUSE_KEY].newValue && changes[PAUSE_KEY].newValue.on) {
-      clearTimeout(clearTimer);
-      unglowAll();
-      try { chrome.storage.local.set({ [ACTIVE_KEY]: { active: false, ts: Date.now() } }); } catch (_) {}
+    // "Parar Claude": ao pausar, remove o glow e mostra a pílula "Retomar" nas abas;
+    // ao retomar (on:false), tira a pílula (o glow volta quando o Claude agir de novo).
+    if (changes[PAUSE_KEY]) {
+      const pv = changes[PAUSE_KEY].newValue;
+      if (pv && pv.on) {
+        clearTimeout(clearTimer);
+        for (const t of glowedTabs) { glow(t, false); showResume(t, true); pausedTabs.add(t); }
+        glowedTabs.clear();
+        try { chrome.storage.local.set({ [ACTIVE_KEY]: { active: false, ts: Date.now() } }); } catch (_) {}
+      } else {
+        for (const t of pausedTabs) showResume(t, false);
+        pausedTabs.clear();
+      }
     }
   });
 
@@ -378,6 +390,7 @@
   // Atividade externa: glow na página + flag para o sidepanel
   // -------------------------------------------------------------------------
   const glowedTabs = new Set(); // TODAS as abas com glow (não uma só) — apaga todas ao encerrar
+  const pausedTabs = new Set(); // abas que receberam a pílula "Retomar" ao pausar
   let clearTimer = null;
   const GLOW_TTL_MS = 15000;    // overlay se auto-remove se não renovado (sobrevive à morte do SW)
 
@@ -423,6 +436,7 @@
             return;
           }
           window.__claudaoGlowTs = Date.now(); // renova (mantém vivo)
+          window.__claudaoActUntil = Date.now() + 2000; // janela de "agindo agora" p/ o takeover
           if (!document.getElementById("__claudao_glow__")) {
             const d = document.createElement("div"); d.id = "__claudao_glow__";
             d.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483646;box-shadow:inset 0 0 0 3px rgba(255,64,64,.95), inset 0 0 42px rgba(255,64,64,.5);animation:__claudaoGlow 1.6s ease-in-out infinite;";
@@ -451,6 +465,7 @@
               if (!ev.isTrusted) return;
               if (ev.target && ev.target.id === "__claudao_stop__") return; // o botão já pausa
               if (!document.getElementById("__claudao_glow__")) return;      // só com glow ativo
+              if (Date.now() > (window.__claudaoActUntil || 0)) return;      // só se o Claude agiu nos últimos ~2s
               try { chrome.storage.local.set({ [pauseKey]: { on: true, ts: Date.now(), reason: "takeover" } }); } catch (_) {}
             };
             addEventListener("mousedown", onUser, true);
@@ -458,6 +473,27 @@
           }
         },
         args: [!!on, client || "", GLOW_TTL_MS, PAUSE_KEY],
+      });
+    } catch (_) {}
+  }
+
+  // Pílula "▶ Retomar Claude" na própria página onde o usuário pausou (o "Retomar" do
+  // painel pode não estar visível se ele está olhando a aba alvo).
+  async function showResume(tabId, on) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (show, pauseKey) => {
+          const ID = "__claudao_resume__";
+          const old = document.getElementById(ID); if (old) old.remove();
+          if (!show) return;
+          const btn = document.createElement("button"); btn.id = ID;
+          btn.textContent = "▶ Retomar Claude";
+          btn.style.cssText = "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#1f7a3a;color:#fff;border:none;border-radius:9px;padding:8px 16px;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 3px 14px rgba(0,0,0,.45);pointer-events:auto;";
+          btn.onclick = (e) => { e.stopPropagation(); try { chrome.storage.local.set({ [pauseKey]: { on: false, ts: Date.now() } }); } catch (_) {} btn.remove(); };
+          (document.body || document.documentElement).appendChild(btn);
+        },
+        args: [!!on, PAUSE_KEY],
       });
     } catch (_) {}
   }
@@ -650,12 +686,15 @@
         if (op === "click") {
           await settleSpinner();
           const el = await waitVisible(p, p.timeoutMs); if (!el) return { ok: false, error: "elemento não encontrado" };
+          if (el.tagName === "INPUT" && el.type === "file") return { ok: false, error: "Este é um <input type=file>: clicar abriria o seletor de arquivos do sistema (trava o agente). Use browser_upload com o caminho do arquivo NESTE input, em vez de clicar." };
+          try { document.documentElement.removeAttribute("data-cm-fileblocked"); } catch (_) {}
           const before = { url: location.href, n: document.body ? document.body.childElementCount : 0 };
           cursorLabel(p.label || "Clicando"); const c = await moveTo(el); ripple(c.x, c.y); await sleep(110); el.click(); cursorLabel("");
           await sleep(220);
           const navigated = location.href !== before.url;
           const changed = navigated || (document.body && document.body.childElementCount !== before.n);
           const r = { ok: true, clicked: true, changed: !!changed, navigated };
+          if (document.documentElement.getAttribute("data-cm-fileblocked")) { r.filePickerBlocked = true; r.hint = "O clique tentaria abrir o seletor de arquivos do sistema (bloqueado para não travar). Use browser_upload com o caminho do arquivo no <input type=file> correspondente."; try { document.documentElement.removeAttribute("data-cm-fileblocked"); } catch (_) {} }
           const errs = detectErrors(); if (errs.length) r.errors = errs;
           return r;
         }
@@ -872,9 +911,13 @@
   // Upload de arquivo(s) num <input type=file> via CDP (caminhos locais).
   async function uploadFiles(tabId, selector, files) {
     return withDebugger(tabId, async (target) => {
-      const { root } = await chrome.debugger.sendCommand(target, "DOM.getDocument", { depth: 0 });
-      const { nodeId } = await chrome.debugger.sendCommand(target, "DOM.querySelector", { nodeId: root.nodeId, selector });
-      if (!nodeId) return { ok: false, error: "input de arquivo não encontrado: " + selector };
+      const { root } = await chrome.debugger.sendCommand(target, "DOM.getDocument", { depth: -1, pierce: true });
+      let nodeId = 0;
+      const q = async (sel) => { try { return (await chrome.debugger.sendCommand(target, "DOM.querySelector", { nodeId: root.nodeId, selector: sel })).nodeId || 0; } catch (_) { return 0; } };
+      if (selector) nodeId = await q(selector);
+      if (!nodeId) nodeId = await q('input[type=file]');       // fallback: primeiro input de arquivo (id dinâmico etc.)
+      if (!nodeId) { try { const all = await chrome.debugger.sendCommand(target, "DOM.querySelectorAll", { nodeId: root.nodeId, selector: 'input[type=file]' }); if (all && all.nodeIds && all.nodeIds.length) nodeId = all.nodeIds[0]; } catch (_) {} }
+      if (!nodeId) return { ok: false, error: "nenhum <input type=file> encontrado" + (selector ? " (nem por '" + selector + "' nem o primeiro da página)" : "") + ". Dica: em alguns sites o input fica oculto atrás do botão de 'carregar'." };
       await chrome.debugger.sendCommand(target, "DOM.setFileInputFiles", { files, nodeId });
       return { ok: true, uploaded: files.length };
     });
@@ -891,6 +934,7 @@
         else if (sel) el = document.querySelector(sel);
         else if (text) { const tt = String(text).toLowerCase(); el = [...document.querySelectorAll("a,button,[role=button],input[type=submit],input[type=button]")].find((e) => ((e.textContent || e.value || "") + "").toLowerCase().includes(tt)); }
         if (!el) return null;
+        if (el.tagName === "INPUT" && el.type === "file") return { fileInput: true };
         el.scrollIntoView({ block: "center" });
         const r = el.getBoundingClientRect();
         return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
@@ -898,6 +942,7 @@
       args: [a.selector || "", a.ref || "", a.text || ""],
     });
     if (!b || !b.result) return { ok: false, error: "elemento não encontrado" };
+    if (b.result.fileInput) return { ok: false, error: "Este é um <input type=file>: use browser_upload com o caminho do arquivo, não clique." };
     const x = Math.round(b.result.x), y = Math.round(b.result.y);
     return withDebugger(tabId, async (target) => {
       const base = { x, y, button: "left", clickCount: 1 };

@@ -65,4 +65,21 @@
       XP.__cmWrapped = true;
     }
   } catch (_) {}
+
+  // --- Anti-trava de upload ---
+  // Enquanto o agente está ativo (o glow #__claudao_glow__ está na tela), NÃO deixa um
+  // clique PROGRAMÁTICO abrir o seletor de arquivos do SO (diálogo modal que trava o
+  // agente). O modelo deve usar browser_upload (caminho do arquivo). O bloqueio é
+  // marcado num atributo do <html> para o agente (mundo isolado) avisar quem clicou.
+  try {
+    const IP = window.HTMLInputElement && window.HTMLInputElement.prototype;
+    const agentActive = () => !!document.getElementById("__claudao_glow__");
+    const markBlocked = (el) => { try { document.documentElement.setAttribute("data-cm-fileblocked", JSON.stringify({ ts: Date.now(), name: (el && (el.name || el.id || el.getAttribute("aria-label"))) || "" })); } catch (_) {} };
+    if (IP && !IP.__cmClickWrapped) {
+      const oc = IP.click;
+      IP.click = function () { if (this.type === "file" && agentActive()) { markBlocked(this); return; } return oc.apply(this, arguments); };
+      IP.__cmClickWrapped = true;
+      if (IP.showPicker) { const op = IP.showPicker; IP.showPicker = function () { if (this.type === "file" && agentActive()) { markBlocked(this); return; } return op.apply(this, arguments); }; }
+    }
+  } catch (_) {}
 })();
