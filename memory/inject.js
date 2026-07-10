@@ -24,6 +24,7 @@
   const ONSFERA_URL = "https://onsfera.com";
   const ACTIVE_KEY = "cm_external_active";
   const PAUSE_KEY = "cm_external_paused";
+  const HANDOFF_KEY = "cm_handoff";
   const STATUS_KEY = "cm_bridge_status";
   const ENABLED_KEY = "cm_bridge_enabled";
   const LOG_KEY = "cm_bridge_log";          // log de ações (auditoria)
@@ -184,6 +185,7 @@
     pt: {
       security: "Segurança", vault: "Cofre",
       paused_by_you: "Claude pausado por você", resume: "Retomar",
+      handoff_passed: "passou uma tarefa pra você:", handoff_continue: "Continuar aqui", handoff_reply: "Responder", dismiss: "Dispensar", handoff_sent: "Resposta enviada ao VS Code.",
       auto_approve: "Aprovar tudo automaticamente", auto_approve_hint: "Ligado: o Claude externo age em qualquer site sem pedir. Desligue para exigir aprovação por domínio (a lista abaixo passa a valer).",
       t_autoapprove_on: "Aprovação automática ligada.", t_autoapprove_off: "Aprovação automática desligada — a allowlist agora vale.",
       ext_reload: "Permitir recarregar a extensão", ext_reload_hint: "Deixa o Claude externo recarregar o Claudão² (pega edições de código sem abrir chrome://extensions).",
@@ -203,6 +205,7 @@
     en: {
       security: "Security", vault: "Vault",
       paused_by_you: "Claude paused by you", resume: "Resume",
+      handoff_passed: "handed a task to you:", handoff_continue: "Continue here", handoff_reply: "Reply", dismiss: "Dismiss", handoff_sent: "Reply sent to VS Code.",
       auto_approve: "Auto-approve everything", auto_approve_hint: "On: external Claude acts on any site without asking. Turn off to require per-domain approval (the list below then applies).",
       t_autoapprove_on: "Auto-approve on.", t_autoapprove_off: "Auto-approve off — the allowlist now applies.",
       ext_reload: "Allow reloading the extension", ext_reload_hint: "Lets external Claude reload Claudão² (picks up code edits without opening chrome://extensions).",
@@ -222,6 +225,7 @@
     es: {
       security: "Seguridad", vault: "Bóveda",
       paused_by_you: "Claude pausado por ti", resume: "Reanudar",
+      handoff_passed: "te pasó una tarea:", handoff_continue: "Continuar aquí", handoff_reply: "Responder", dismiss: "Descartar", handoff_sent: "Respuesta enviada a VS Code.",
       auto_approve: "Aprobar todo automáticamente", auto_approve_hint: "Activado: el Claude externo actúa en cualquier sitio sin pedir. Desactívalo para exigir aprobación por dominio (la lista de abajo pasa a valer).",
       t_autoapprove_on: "Aprobación automática activada.", t_autoapprove_off: "Aprobación automática desactivada — la lista ahora vale.",
       ext_reload: "Permitir recargar la extensión", ext_reload_hint: "Deja que el Claude externo recargue Claudão² (toma cambios de código sin abrir chrome://extensions).",
@@ -262,6 +266,7 @@
     }
     if (changes[ACTIVE_KEY]) applyExternalState(changes[ACTIVE_KEY].newValue);
     if (changes[PAUSE_KEY]) applyPaused(changes[PAUSE_KEY].newValue);
+    if (changes[HANDOFF_KEY]) applyHandoff(changes[HANDOFF_KEY].newValue);
     if (changes[STATUS_KEY] || changes[ENABLED_KEY] || changes[PATHS_KEY]) refreshConnect();
     if (changes[CONSENT_KEY]) applyConsent(changes[CONSENT_KEY].newValue);
     if ((changes[LOG_KEY] || changes[ALLOW_KEY]) && curScreen === "security") refreshSecurity();
@@ -1081,6 +1086,36 @@
     if (!IS_SIDEPANEL) return;
     try { applyPaused((await chrome.storage.local.get(PAUSE_KEY))[PAUSE_KEY]); } catch (_) {}
   }
+
+  // Handoff: o Claude do VS Code passou uma tarefa → card no painel para o Claude
+  // nativo do navegador (ou o usuário) assumir. Compartilham a mesma memória.
+  async function getHandoff() { try { return (await chrome.storage.local.get(HANDOFF_KEY))[HANDOFF_KEY] || {}; } catch (_) { return {}; } }
+  function ensureHandoffUI() { if (!shadow || shadow.getElementById("cm-handoff")) return; shadow.appendChild(h("div", { id: "cm-handoff", style: "display:none" })); }
+  let handoffSig = null;
+  function applyHandoff(hf) {
+    if (!IS_SIDEPANEL || !shadow) return;
+    ensureHandoffUI();
+    const box = shadow.getElementById("cm-handoff");
+    if (!hf || !hf.message || hf.dismissed) { box.style.display = "none"; handoffSig = null; return; }
+    const sig = hf.ts + ""; if (handoffSig === sig) return; handoffSig = sig;
+    box.innerHTML = "";
+    const card = h("div", { className: "cm-handoff-card" }, [
+      h("div", { className: "cm-handoff-from", innerHTML: "🤝 <strong>" + escapeHtml(prettyClient(hf.from)) + "</strong> " + t("handoff_passed") }),
+      h("div", { className: "cm-handoff-msg", textContent: hf.message }),
+    ]);
+    const cont = h("button", { className: "cm-primary", textContent: t("handoff_continue") });
+    cont.addEventListener("click", async () => { insertIntoComposer(hf.message); const cur = await getHandoff(); cur.seen = true; cur.dismissed = true; try { await chrome.storage.local.set({ [HANDOFF_KEY]: cur }); } catch (_) {} box.style.display = "none"; togglePanel(); });
+    const rep = h("button", { className: "cm-handoff-reply", textContent: t("handoff_reply") });
+    rep.addEventListener("click", async () => { const r = prompt(t("handoff_reply")); if (r == null) return; const cur = await getHandoff(); cur.reply = r; try { await chrome.storage.local.set({ [HANDOFF_KEY]: cur }); } catch (_) {} toast(t("handoff_sent")); });
+    const dis = h("button", { className: "cm-handoff-dismiss", textContent: t("dismiss") });
+    dis.addEventListener("click", async () => { const cur = await getHandoff(); cur.dismissed = true; try { await chrome.storage.local.set({ [HANDOFF_KEY]: cur }); } catch (_) {} box.style.display = "none"; });
+    card.appendChild(h("div", { className: "cm-handoff-btns" }, [cont, rep, dis]));
+    box.appendChild(card); box.style.display = "flex";
+  }
+  async function pollHandoff() {
+    if (!IS_SIDEPANEL) return;
+    try { applyHandoff((await chrome.storage.local.get(HANDOFF_KEY))[HANDOFF_KEY]); } catch (_) {}
+  }
   function positionLock(lock) {
     const el = getComposer();
     let top = window.innerHeight - 130, height = 130;
@@ -1373,7 +1408,7 @@
     buildUI();
     loadSettings().finally(startObservers);
     maybeShowAttribution();
-    if (IS_SIDEPANEL) { ensureExternalUI(); ensureConsentUI(); pollExternal(); pollConsent(); pollPaused(); refreshConnect(); setInterval(() => { pollExternal(); pollConsent(); pollPaused(); }, 2500); }
+    if (IS_SIDEPANEL) { ensureExternalUI(); ensureConsentUI(); ensureHandoffUI(); pollExternal(); pollConsent(); pollPaused(); pollHandoff(); refreshConnect(); setInterval(() => { pollExternal(); pollConsent(); pollPaused(); pollHandoff(); }, 2500); }
   }
 
   // ---------------------------------------------------------------------------
@@ -1637,6 +1672,15 @@
       display: flex; align-items: center; justify-content: center; gap: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.4); }
     .cm-pause-resume { background: #fff; color: #7a1f1f; border: none; border-radius: 7px; padding: 5px 14px; font: 600 12px system-ui, sans-serif; cursor: pointer; }
     .cm-pause-resume:hover { background: #ffe9e9; }
+    #cm-handoff { position: fixed; top: 0; left: 0; right: 0; z-index: 45; display: flex; justify-content: center; padding: 10px; }
+    .cm-handoff-card { background: var(--head); border: 1px solid var(--accent); border-radius: 12px; padding: 12px 14px; max-width: 360px; width: 100%; box-shadow: 0 10px 30px var(--shadow); }
+    .cm-handoff-from { font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+    .cm-handoff-from strong { color: var(--text); }
+    .cm-handoff-msg { font-size: 13px; color: var(--text); line-height: 1.45; max-height: 120px; overflow-y: auto; margin-bottom: 10px; white-space: pre-wrap; }
+    .cm-handoff-btns { display: flex; gap: 7px; }
+    .cm-handoff-btns .cm-primary { flex: 1; }
+    .cm-handoff-reply, .cm-handoff-dismiss { background: var(--btn); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; font: 500 12px system-ui, sans-serif; cursor: pointer; }
+    .cm-handoff-reply:hover, .cm-handoff-dismiss:hover { background: var(--btn-hover); }
     #cm-extlock { position: fixed; z-index: 41; background: var(--overlay); backdrop-filter: blur(1.5px);
       display: flex; align-items: flex-start; justify-content: center; padding-top: 16px; }
     #cm-extlock span { display: inline-flex; align-items: center; gap: 7px; background: var(--head); color: #ffb4b4;

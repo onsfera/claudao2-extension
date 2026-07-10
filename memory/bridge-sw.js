@@ -42,6 +42,7 @@
   const VAULT_KEY = "cm_vault";             // credenciais do cofre {items:[{id,domain,name,username,value}]}
   const PAUSE_KEY = "cm_external_paused";   // "Parar Claude": recusa comandos até retomar
   const REDACTPII_KEY = "cm_redact_pii";    // borrar campos sensíveis nas screenshots (padrão: não)
+  const HANDOFF_KEY = "cm_handoff";         // passagem de tarefa Claude-editor <-> Claude-navegador
   const DEFAULT_ALLOW = ["localhost", "127.0.0.1"];
   const ACTIVE_IDLE_MS = 12000;             // trava/banner só somem após esse ocioso (evita piscar entre comandos)
   // Comandos que MODIFICAM/interagem (exigem domínio aprovado). Percepção é livre.
@@ -1047,6 +1048,17 @@
       case "credentials_delete": {
         if (!a.name) throw new Error("faltou 'name'");
         return { ok: true, result: await vaultDelete(a.name, a.domain) };
+      }
+
+      // --- Handoff: passa a tarefa para o Claude nativo do navegador (ou lê a resposta) ---
+      case "handoff": {
+        if (a.read) {
+          let hf = null; try { hf = (await chrome.storage.local.get(HANDOFF_KEY))[HANDOFF_KEY]; } catch (_) {}
+          return { ok: true, result: hf || { message: null, reply: null } };
+        }
+        if (!a.message) throw new Error("faltou 'message' (o que o Claude do navegador deve continuar)");
+        await chrome.storage.local.set({ [HANDOFF_KEY]: { from: msg.client || "Claude externo", message: String(a.message).slice(0, 2000), task: a.task || null, ts: Date.now(), seen: false, dismissed: false, reply: null } });
+        return { ok: true, result: { delivered: true, note: "Tarefa entregue ao Claude do navegador. Use handoff {read:true} depois para ver a resposta dele." } };
       }
 
       // --- Memória (Claude externo lê/escreve a memória do Claudão²) ---
