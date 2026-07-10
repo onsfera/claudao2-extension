@@ -41,6 +41,7 @@
   const EXTRELOAD_KEY = "cm_allow_ext_reload"; // deixar o Claude externo recarregar a extensão (padrão: sim)
   const VAULT_KEY = "cm_vault";             // credenciais do cofre {items:[{id,domain,name,username,value}]}
   const PAUSE_KEY = "cm_external_paused";   // "Parar Claude": recusa comandos até retomar
+  const REDACTPII_KEY = "cm_redact_pii";    // borrar campos sensíveis nas screenshots (padrão: não)
   const DEFAULT_ALLOW = ["localhost", "127.0.0.1"];
   const ACTIVE_IDLE_MS = 12000;             // trava/banner só somem após esse ocioso (evita piscar entre comandos)
   // Comandos que MODIFICAM/interagem (exigem domínio aprovado). Percepção é livre.
@@ -229,6 +230,26 @@
   }
   async function getAllowExtReload() {
     try { const v = (await chrome.storage.local.get(EXTRELOAD_KEY))[EXTRELOAD_KEY]; return v == null ? true : !!v; } catch (_) { return true; }
+  }
+  async function getRedactPII() {
+    try { return !!(await chrome.storage.local.get(REDACTPII_KEY))[REDACTPII_KEY]; } catch (_) { return false; }
+  }
+  // Desenha tarjas pretas sobre bboxes (viewport) numa imagem base64, via OffscreenCanvas (SW).
+  async function redactImage(dataUrl, boxes, factor) {
+    try {
+      const blob = await (await fetch(dataUrl)).blob();
+      const bmp = await createImageBitmap(blob);
+      const canvas = new OffscreenCanvas(bmp.width, bmp.height);
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(bmp, 0, 0);
+      ctx.fillStyle = "#000";
+      for (const b of boxes) ctx.fillRect(Math.round(b.x * factor), Math.round(b.y * factor), Math.round(b.w * factor), Math.round(b.h * factor));
+      const mime = dataUrl.startsWith("data:image/png") ? "image/png" : "image/jpeg";
+      const outBlob = await canvas.convertToBlob({ type: mime, quality: 0.72 });
+      const bytes = new Uint8Array(await outBlob.arrayBuffer());
+      let bin = ""; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      return "data:" + mime + ";base64," + btoa(bin);
+    } catch (_) { return dataUrl; }
   }
   async function hostAllowed(host) {
     if (await getAllowAll()) return true;   // dono liberou tudo (padrão) → sem consentimento
@@ -482,17 +503,24 @@
     const format = opts.format === "png" ? "png" : "jpeg";
     const quality = Math.max(20, Math.min(95, opts.quality || 72));
     const maxWidth = opts.maxWidth || 1280;
-    // Uma injeção pega o DPR e, se houver selector, rola o elemento à vista e mede (viewport-relativo).
-    let info = { dpr: 1, rect: null };
+    const redactOn = opts.redactPII != null ? !!opts.redactPII : await getRedactPII();
+    const wantPII = redactOn && !opts.fullPage && !opts.selector; // redação só no viewport (coords batem)
+    // Uma injeção pega o DPR, o rect do elemento (se selector) e as bboxes de PII (se redação).
+    let info = { dpr: 1, rect: null, pii: [] };
     try {
       const [b] = await chrome.scripting.executeScript({
         target: { tabId },
-        func: (sel) => {
+        func: (sel, wantPII) => {
           let rect = null;
           if (sel) { const e = document.querySelector(sel); if (e) { e.scrollIntoView({ block: "center" }); const r = e.getBoundingClientRect(); rect = { x: r.left, y: r.top, width: r.width, height: r.height }; } }
-          return { dpr: window.devicePixelRatio || 1, rect };
+          const pii = [];
+          if (wantPII) {
+            const psel = 'input[type=password],input[type=email],input[type=tel],input[autocomplete*="cc-"],input[autocomplete="email"],input[autocomplete="tel"],input[name*="card" i],input[name*="cpf" i],input[name*="senha" i],input[name*="cartao" i]';
+            try { for (const e of document.querySelectorAll(psel)) { const r = e.getBoundingClientRect(); if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth) pii.push({ x: Math.max(0, r.left), y: Math.max(0, r.top), w: r.width, h: r.height }); } } catch (_) {}
+          }
+          return { dpr: window.devicePixelRatio || 1, rect, pii };
         },
-        args: [opts.selector || ""],
+        args: [opts.selector || "", wantPII],
       });
       if (b && b.result) info = b.result;
     } catch (_) {}
@@ -515,7 +543,9 @@
       if (format === "jpeg") shot.quality = quality;
       if (clip) shot.clip = { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale };
       const { data } = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", shot);
-      return { dataUrl: "data:image/" + format + ";base64," + data, mime: "image/" + format, width: clip ? Math.round(clip.width * scale * dpr) : null, height: clip ? Math.round(clip.height * scale * dpr) : null, scale: Math.round(scale * 100) / 100 };
+      let dataUrl = "data:image/" + format + ";base64," + data, redacted = 0;
+      if (wantPII && info.pii && info.pii.length) { dataUrl = await redactImage(dataUrl, info.pii, scale * dpr); redacted = info.pii.length; }
+      return { dataUrl, mime: "image/" + format, width: clip ? Math.round(clip.width * scale * dpr) : null, height: clip ? Math.round(clip.height * scale * dpr) : null, scale: Math.round(scale * 100) / 100, redacted };
     });
   }
 
@@ -595,15 +625,48 @@
         document.documentElement.appendChild(rp);
         setTimeout(() => rp.remove(), 520);
       }
+      // Confiabilidade: detectar erros de validação, spinners e modais.
+      function detectErrors() {
+        const out = [];
+        try {
+          const sel = '[role=alert],[aria-invalid="true"],.error,.is-invalid,.invalid-feedback,.field-error,.form-error,.error-message,.errorMessage';
+          for (const e of document.querySelectorAll(sel)) {
+            if (!visible(e)) continue;
+            let t = e.getAttribute("aria-invalid") === "true" ? (e.getAttribute("aria-label") || e.getAttribute("name") || e.placeholder || "campo inválido") : (e.textContent || "");
+            t = (t || "").replace(/\s+/g, " ").trim();
+            if (t && t.length <= 160) out.push(t);
+            if (out.length >= 8) break;
+          }
+        } catch (_) {}
+        return [...new Set(out)];
+      }
+      function findSpinner() { try { return [...document.querySelectorAll('[role=progressbar],[aria-busy="true"],.spinner,.loader,.loading-spinner')].find(visible) || null; } catch (_) { return null; } }
+      function topModal() { try { const els = [...document.querySelectorAll('[role=dialog],[aria-modal="true"],.modal,dialog[open]')].filter(visible); return els.length ? els[els.length - 1] : null; } catch (_) { return null; } }
+      async function settleSpinner(max) { if (!findSpinner()) return; const t0 = Date.now(); while (Date.now() - t0 < (max || 3000)) { if (!findSpinner()) return; await sleep(150); } }
+
       const op = p.op;
       try {
         if (op === "click") {
+          await settleSpinner();
           const el = await waitVisible(p, p.timeoutMs); if (!el) return { ok: false, error: "elemento não encontrado" };
-          cursorLabel(p.label || "Clicando"); const c = await moveTo(el); ripple(c.x, c.y); await sleep(110); el.click(); cursorLabel(""); return { ok: true, clicked: true };
+          const before = { url: location.href, n: document.body ? document.body.childElementCount : 0 };
+          cursorLabel(p.label || "Clicando"); const c = await moveTo(el); ripple(c.x, c.y); await sleep(110); el.click(); cursorLabel("");
+          await sleep(220);
+          const navigated = location.href !== before.url;
+          const changed = navigated || (document.body && document.body.childElementCount !== before.n);
+          const r = { ok: true, clicked: true, changed: !!changed, navigated };
+          const errs = detectErrors(); if (errs.length) r.errors = errs;
+          return r;
         }
         if (op === "fill" || op === "fill_secret") {
+          await settleSpinner();
           const el = await waitVisible(p); if (!el) return { ok: false, error: "campo não encontrado" };
-          cursorLabel(op === "fill_secret" ? "Preenchendo •••" : "Preenchendo"); await moveTo(el); if (p.clearFirst) setVal(el, ""); setVal(el, p.value != null ? p.value : ""); cursorLabel(""); return { ok: true, filled: true };
+          cursorLabel(op === "fill_secret" ? "Preenchendo •••" : "Preenchendo"); await moveTo(el); if (p.clearFirst) setVal(el, ""); setVal(el, p.value != null ? p.value : ""); cursorLabel("");
+          const expected = p.value != null ? String(p.value) : "";
+          const verified = op === "fill_secret" ? (String(el.value || "").length === expected.length) : (String(el.value || "") === expected);
+          const r = { ok: true, filled: true, verified };
+          const errs = detectErrors(); if (errs.length) r.errors = errs;
+          return r;
         }
         if (op === "type") {
           const el = (p.selector || p.ref) ? await waitVisible(p) : document.activeElement; if (!el) return { ok: false, error: "sem elemento focado" };
@@ -653,12 +716,17 @@
           const el = resolveEl(p); if (!el || el.tagName !== "SELECT") return { ok: false, error: "select não encontrado" };
           let opt = null; if (p.value != null) opt = [...el.options].find((o) => o.value === p.value); if (!opt && p.label) opt = [...el.options].find((o) => (o.textContent || "").trim() === p.label);
           if (!opt) return { ok: false, error: "opção não encontrada" };
-          el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true })); return { ok: true, selected: opt.value };
+          el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true })); return { ok: true, selected: opt.value, verified: el.value === opt.value };
         }
         if (op === "submit") {
           const base = (p.selector || p.ref) ? resolveEl(p) : document.querySelector("form");
           const form = base && (base.tagName === "FORM" ? base : base.closest("form")); if (!form) return { ok: false, error: "form não encontrado" };
-          form.requestSubmit ? form.requestSubmit() : form.submit(); return { ok: true };
+          const before = location.href;
+          form.requestSubmit ? form.requestSubmit() : form.submit();
+          await sleep(400);
+          const r = { ok: true, submitted: true, navigated: location.href !== before };
+          const errs = detectErrors(); if (errs.length) r.errors = errs;
+          return r;
         }
         if (op === "query") {
           let els; try { els = [...document.querySelectorAll(p.selector)]; } catch (_) { return { ok: false, error: "seletor inválido" }; }
@@ -673,7 +741,7 @@
           return { ok: true, url: location.href, title: document.title, elements: out };
         }
         if (op === "get_state") {
-          const s = { ok: true, url: location.href, title: document.title, readyState: document.readyState, viewport: { w: innerWidth, h: innerHeight } };
+          const s = { ok: true, url: location.href, title: document.title, readyState: document.readyState, viewport: { w: innerWidth, h: innerHeight }, modalOpen: !!topModal(), spinner: !!findSpinner() };
           if (p.includeStorage) { s.cookies = document.cookie.slice(0, 800); try { s.localStorageKeys = Object.keys(localStorage).slice(0, 60); } catch (_) {} }
           return s;
         }
@@ -747,7 +815,7 @@
             box.appendChild(ol); box.appendChild(badge);
             out.push({ ref, mark: i, role, label, x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) });
           }
-          return { ok: true, url: location.href, title: document.title, count: out.length, elements: out };
+          return { ok: true, url: location.href, title: document.title, count: out.length, elements: out, modalOpen: !!topModal(), spinner: !!findSpinner() };
         }
         if (op === "inspect") {
           const el = resolveEl(p); if (!el) return { ok: false, error: "elemento não encontrado" };
@@ -861,15 +929,15 @@
         return { ok: true, result: r ? r.result : [] };
       }
       case "eval": { if (!a.code) throw new Error("faltou 'code'"); return { ok: true, result: await evalInTab(tabId, a.code) }; }
-      case "screenshot": { return { ok: true, result: await screenshotTab(tabId, { fullPage: a.fullPage, selector: a.selector, maxWidth: a.maxWidth, format: a.format, quality: a.quality }) }; }
+      case "screenshot": { return { ok: true, result: await screenshotTab(tabId, { fullPage: a.fullPage, selector: a.selector, maxWidth: a.maxWidth, format: a.format, quality: a.quality, redactPII: a.redactPII }) }; }
       case "look": {
         // Set-of-marks: marca os elementos, tira a foto (leve) com os números, devolve foto + mapa.
         const map = await agentExec(tabId, { op: "mark", limit: a.limit });
         if (!map || !map.ok) return { ok: false, error: (map && map.error) || "falha ao marcar" };
         await new Promise((r) => setTimeout(r, 160)); // deixa os badges pintarem antes da captura
-        const shot = await screenshotTab(tabId, { maxWidth: a.maxWidth, format: a.format || "jpeg", quality: a.quality });
+        const shot = await screenshotTab(tabId, { maxWidth: a.maxWidth, format: a.format || "jpeg", quality: a.quality, redactPII: a.redactPII });
         setTimeout(() => { agentExec(tabId, { op: "unmark" }).catch(() => {}); }, a.keepMarks ? 4000 : 900);
-        return { ok: true, result: { look: true, url: map.url, title: map.title, dataUrl: shot.dataUrl, mime: shot.mime, width: shot.width, height: shot.height, count: map.count, elements: map.elements } };
+        return { ok: true, result: { look: true, url: map.url, title: map.title, dataUrl: shot.dataUrl, mime: shot.mime, width: shot.width, height: shot.height, count: map.count, elements: map.elements, modalOpen: map.modalOpen, spinner: map.spinner } };
       }
       case "mark": { const r = await agentExec(tabId, { op: a.clear ? "unmark" : "mark", limit: a.limit }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error }; }
       case "inspect": { const r = await agentExec(tabId, { op: "inspect", selector: a.selector, ref: a.ref, text: a.text }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error }; }

@@ -33,6 +33,7 @@
   const VAULT_KEY = "cm_vault";             // cofre de credenciais
   const ALLOWALL_KEY = "cm_bridge_allow_all"; // aprovar tudo automaticamente (padrão: sim)
   const EXTRELOAD_KEY = "cm_allow_ext_reload"; // deixar o Claude externo recarregar a extensão (padrão: sim)
+  const REDACTPII_KEY = "cm_redact_pii";     // borrar campos sensíveis nas screenshots (padrão: não)
   const DEFAULT_ALLOW = ["localhost", "127.0.0.1"];
   // Placeholder distribuível (o Chrome não sabe o próprio path no disco). Ao conectar,
   // o server informa o caminho REAL desta máquina (server_hello → cm_bridge_paths) e a
@@ -187,6 +188,8 @@
       t_autoapprove_on: "Aprovação automática ligada.", t_autoapprove_off: "Aprovação automática desligada — a allowlist agora vale.",
       ext_reload: "Permitir recarregar a extensão", ext_reload_hint: "Deixa o Claude externo recarregar o Claudão² (pega edições de código sem abrir chrome://extensions).",
       t_extreload_on: "Recarregar extensão liberado.", t_extreload_off: "Recarregar extensão bloqueado.",
+      redact_pii: "Borrar dados sensíveis nas fotos", redact_pii_hint: "Tarja senha, e-mail, telefone, cartão e CPF nas screenshots antes de irem ao modelo. O Claude opera o formulário sem ver seus dados.",
+      t_redact_on: "Redação de dados nas fotos ligada.", t_redact_off: "Redação de dados nas fotos desligada.",
       allowlist_hint: "Ações (clicar, preencher, logar, navegar) só rodam em domínios aprovados. Percepção (ler, console, screenshot) é sempre livre. localhost e 127.0.0.1 já vêm liberados.",
       domain_ph: "ex.: meusite.com", action_log: "Log de ações", no_log: "Nenhuma ação registrada ainda.", clear_log: "Limpar",
       vault_hint: "Credenciais cifradas neste navegador (chave que não sai do dispositivo). O Claude externo referencia pelo nome (credentialRef) e nunca vê o valor.",
@@ -204,6 +207,8 @@
       t_autoapprove_on: "Auto-approve on.", t_autoapprove_off: "Auto-approve off — the allowlist now applies.",
       ext_reload: "Allow reloading the extension", ext_reload_hint: "Lets external Claude reload Claudão² (picks up code edits without opening chrome://extensions).",
       t_extreload_on: "Extension reload allowed.", t_extreload_off: "Extension reload blocked.",
+      redact_pii: "Blur sensitive data in screenshots", redact_pii_hint: "Black out password, email, phone, card and ID fields in screenshots before they reach the model. Claude works the form without seeing your data.",
+      t_redact_on: "Screenshot data redaction on.", t_redact_off: "Screenshot data redaction off.",
       allowlist_hint: "Actions (click, fill, login, navigate) only run on approved domains. Perception (read, console, screenshot) is always free. localhost and 127.0.0.1 are allowed by default.",
       domain_ph: "e.g. mysite.com", action_log: "Action log", no_log: "No actions logged yet.", clear_log: "Clear",
       vault_hint: "Credentials encrypted in this browser (device-bound key). External Claude references them by name (credentialRef) and never sees the value.",
@@ -221,6 +226,8 @@
       t_autoapprove_on: "Aprobación automática activada.", t_autoapprove_off: "Aprobación automática desactivada — la lista ahora vale.",
       ext_reload: "Permitir recargar la extensión", ext_reload_hint: "Deja que el Claude externo recargue Claudão² (toma cambios de código sin abrir chrome://extensions).",
       t_extreload_on: "Recarga de extensión permitida.", t_extreload_off: "Recarga de extensión bloqueada.",
+      redact_pii: "Difuminar datos sensibles en las fotos", redact_pii_hint: "Tapa contraseña, correo, teléfono, tarjeta y documento en las capturas antes de ir al modelo. Claude opera el formulario sin ver tus datos.",
+      t_redact_on: "Redacción de datos en fotos activada.", t_redact_off: "Redacción de datos en fotos desactivada.",
       allowlist_hint: "Las acciones (clic, rellenar, iniciar sesión, navegar) solo se ejecutan en dominios aprobados. La percepción (leer, consola, captura) siempre es libre. localhost y 127.0.0.1 ya vienen permitidos.",
       domain_ph: "ej.: misitio.com", action_log: "Registro de acciones", no_log: "Aún no hay acciones registradas.", clear_log: "Limpiar",
       vault_hint: "Credenciales cifradas en este navegador (clave que no sale del dispositivo). El Claude externo las referencia por nombre (credentialRef) y nunca ve el valor.",
@@ -881,6 +888,10 @@
       await chrome.storage.local.set({ [EXTRELOAD_KEY]: e.target.checked });
       toast(e.target.checked ? t("t_extreload_on") : t("t_extreload_off"));
     });
+    $("#cm-redact-pii").addEventListener("change", async (e) => {
+      await chrome.storage.local.set({ [REDACTPII_KEY]: e.target.checked });
+      toast(e.target.checked ? t("t_redact_on") : t("t_redact_off"));
+    });
     $("#cm-allow-add").addEventListener("click", addDomain);
     $("#cm-allow-input").addEventListener("keydown", (e) => { if (e.key === "Enter") addDomain(); });
     $("#cm-log-clear").addEventListener("click", async () => { await chrome.storage.local.set({ [LOG_KEY]: [] }); refreshSecurity(); toast(t("t_log_cleared")); });
@@ -1144,6 +1155,7 @@
     try { const v = (await chrome.storage.local.get(ALLOWALL_KEY))[ALLOWALL_KEY]; allowAll = v == null ? true : !!v; } catch (_) {}
     const chk = shadow.getElementById("cm-allow-all"); if (chk) chk.checked = allowAll;
     try { const rv = (await chrome.storage.local.get(EXTRELOAD_KEY))[EXTRELOAD_KEY]; const rchk = shadow.getElementById("cm-ext-reload"); if (rchk) rchk.checked = rv == null ? true : !!rv; } catch (_) {}
+    try { const pv = (await chrome.storage.local.get(REDACTPII_KEY))[REDACTPII_KEY]; const pchk = shadow.getElementById("cm-redact-pii"); if (pchk) pchk.checked = !!pv; } catch (_) {}
     // Com "aprovar tudo" ligado, a allowlist fica inativa (esmaecida).
     const addrow = shadow.querySelector("#cm-screen-security .cm-addrow");
     if (addrow) addrow.style.opacity = allowAll ? ".45" : "1";
@@ -1440,6 +1452,8 @@
       <p class="cm-conn-hint">${t("auto_approve_hint")}</p>
       <label class="cm-conn-toggle"><input type="checkbox" id="cm-ext-reload" /> <span>${t("ext_reload")}</span></label>
       <p class="cm-conn-hint">${t("ext_reload_hint")}</p>
+      <label class="cm-conn-toggle"><input type="checkbox" id="cm-redact-pii" /> <span>${t("redact_pii")}</span></label>
+      <p class="cm-conn-hint">${t("redact_pii_hint")}</p>
       <p class="cm-conn-p">${t("allowlist_hint")}</p>
       <div class="cm-addrow">
         <input id="cm-allow-input" placeholder="${t("domain_ph")}" />
