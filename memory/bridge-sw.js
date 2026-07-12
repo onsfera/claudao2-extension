@@ -601,12 +601,33 @@
     try { return await fn(target); }
     finally { try { await chrome.debugger.detach(target); } catch (_) {} }
   }
+  // Corre uma promise contra um timeout (rejeita se estourar). Usado p/ comandos CDP que podem travar.
+  function withTimeout(promise, ms, label) {
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("tempo esgotado" + (label ? " (" + label + ")" : "") + " após " + ms + "ms")), ms);
+      promise.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+    });
+  }
+  const isB64 = (s) => typeof s === "string" && s.length > 100 && /^[A-Za-z0-9+/]+={0,2}$/.test(s);
+  // Espera a aba terminar de carregar (status "complete") após uma navegação — evita snapshot
+  // da página ANTERIOR em SPAs. Não faz check de "já completo" (seria o da página velha);
+  // o listener é adicionado logo após disparar a navegação, então o próximo "complete" é o novo.
+  function waitTabComplete(tabId, ms) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => { if (done) return; done = true; clearTimeout(t); try { chrome.tabs.onUpdated.removeListener(onUpd); } catch (_) {} resolve(v); };
+      const onUpd = (id, info) => { if (id === tabId && info.status === "complete") finish("complete"); };
+      const t = setTimeout(() => finish("timeout"), ms || 15000);
+      try { chrome.tabs.onUpdated.addListener(onUpd); } catch (_) { finish("no-api"); }
+    });
+  }
 
-  async function evalInTab(tabId, code) {
+  async function evalInTab(tabId, code, timeoutMs) {
+    const ms = Math.max(1000, Math.min(590000, timeoutMs || 30000)); // padrão 30s; teto ~10min
     return withDebugger(tabId, async (target) => {
-      const r = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+      const r = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
         expression: code, returnByValue: true, awaitPromise: true, userGesture: true, allowUnsafeEvalBlockedByCSP: true,
-      });
+      }), ms, "eval");
       if (r && r.exceptionDetails) {
         const ex = r.exceptionDetails;
         return { error: (ex.exception && (ex.exception.description || ex.exception.value)) || ex.text || "erro na avaliação" };
@@ -627,9 +648,9 @@
     const redactOn = opts.redactPII != null ? !!opts.redactPII : await getRedactPII();
     const wantPII = redactOn && !opts.fullPage && !opts.selector; // redação só no viewport (coords batem)
     // Uma injeção pega o DPR, o rect do elemento (se selector) e as bboxes de PII (se redação).
-    let info = { dpr: 1, rect: null, pii: [] };
+    let info = { dpr: 1, rect: null, pii: [] }, infoOk = false;
     try {
-      const [b] = await chrome.scripting.executeScript({
+      const [b] = await withTimeout(chrome.scripting.executeScript({
         target: { tabId },
         func: (sel, wantPII) => {
           let rect = null;
@@ -642,11 +663,18 @@
           return { dpr: window.devicePixelRatio || 1, rect, pii };
         },
         args: [opts.selector || "", wantPII],
-      });
-      if (b && b.result) info = b.result;
+      }), 6000, "shot-info");
+      if (b && b.result) { info = b.result; infoOk = true; }
     } catch (_) {}
+    // Falha EXPLÍCITA em vez de foto errada silenciosa: (1) pediram selector mas o elemento não casou
+    // (ou a injeção expirou) → não devolver o viewport achando que é o recorte; (2) pediram redação de
+    // PII mas não deu p/ computar as tarjas → aborta (fail-closed) p/ não vazar campo sensível.
+    if (opts.selector && !opts.fullPage && !info.rect) throw new Error("captura por selector: elemento não encontrado" + (infoOk ? "" : " (a página demorou a responder — tente de novo)") + " — confira o selector ou capture o viewport sem selector.");
+    if (wantPII && !infoOk) throw new Error("captura com redação de PII abortada: a página demorou a responder e as áreas a borrar não puderam ser calculadas (não vou entregar a imagem sem as tarjas) — tente de novo.");
     return withDebugger(tabId, async (target) => {
-      const m = await chrome.debugger.sendCommand(target, "Page.getLayoutMetrics", {});
+      // COM timeout: sem ele, um renderer travado deixaria a promise pendente pra sempre → o
+      // withDebugger nunca detacha (debugger preso) e a fila da aba (withTabLock) deadlocka.
+      const m = await withTimeout(chrome.debugger.sendCommand(target, "Page.getLayoutMetrics", {}), 8000, "getLayoutMetrics");
       let clip = null, beyond = false;
       if (opts.selector && info.rect) {
         // Elemento já rolado à vista → clip viewport-relativo, sem captureBeyondViewport.
@@ -663,7 +691,20 @@
       const shot = { format, captureBeyondViewport: beyond };
       if (format === "jpeg") shot.quality = quality;
       if (clip) shot.clip = { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale };
-      const { data } = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", shot);
+      // A captura CDP às vezes volta base64 vazio/malformado ("Invalid Base64"): re-tenta SÓ nesse
+      // caso (dado ruim). Em TIMEOUT não re-dispara (evita empilhar capturas concorrentes competindo
+      // pelo renderer) e reporta erro distinto. fullPage (página muito alta) ganha timeout maior.
+      const capMs = opts.fullPage ? 30000 : 12000;
+      let data = null, lastErr = "";
+      for (let attempt = 0; attempt < 3; attempt++) {
+        let res = null;
+        try { res = await withTimeout(chrome.debugger.sendCommand(target, "Page.captureScreenshot", shot), capMs, "captureScreenshot"); }
+        catch (e) { lastErr = "timeout (" + capMs + "ms)"; break; } // timeout/erro CDP: não re-dispara
+        data = res && res.data;
+        if (isB64(data)) break;
+        data = null; lastErr = "base64 vazio/malformado"; await new Promise((r) => setTimeout(r, 250));
+      }
+      if (!data) throw new Error("captura de tela falhou (" + (lastErr || "desconhecido") + ")" + (opts.fullPage ? " — página muito longa/alta; tente sem fullPage, com selector, ou maxWidth menor" : " — tente de novo"));
       let dataUrl = "data:image/" + format + ";base64," + data, redacted = 0;
       if (wantPII && info.pii && info.pii.length) { dataUrl = await redactImage(dataUrl, info.pii, scale * dpr); redacted = info.pii.length; }
       return { dataUrl, mime: "image/" + format, width: clip ? Math.round(clip.width * scale * dpr) : null, height: clip ? Math.round(clip.height * scale * dpr) : null, scale: Math.round(scale * 100) / 100, redacted };
@@ -711,8 +752,25 @@
         } catch (_) {}
       }
       function visible(el) { if (!el) return false; const r = el.getBoundingClientRect(); const cs = getComputedStyle(el); return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0"; }
-      function normTxt(s) { return (s || "").replace(/\s+/g, " ").trim().toLowerCase(); }
-      function findByText(text) { const t = normTxt(text); if (!t) return null; return [...document.querySelectorAll("a,button,[role=button],[role=link],input[type=submit],input[type=button],summary,[role=menuitem],[role=tab],[role=option]")].find((e) => normTxt(e.textContent || e.value || "").includes(t)) || null; }
+      // Descarta elementos jogados pra FORA da tela (ex.: o contenteditable-fantasma de
+      // acessibilidade do LinkedIn em x:-99718,w:0,h:1) — eles passam no visible() de estilo
+      // mas não são alvos reais de clique/digitação.
+      // Interseção REAL no eixo X (não bounds fixos): um clicável largo parcialmente rolado p/ a
+      // esquerda (tabela/kanban/RTL, left=-1200/right=800) continua na tela e deve passar; o
+      // fantasma (w:0,h:1,right<0) é barrado por width/height>1 e right>0.
+      function onScreen(el) { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1 && r.right > 0 && r.left < innerWidth; }
+      function normTxt(s) { return String(s == null ? "" : s).replace(/\s+/g, " ").trim().toLowerCase(); } // String() evita TypeError em .value numérico (<progress>/<meter>/<li>)
+      // Acha um clicável por texto priorizando: exato > começa-com > contém; e entre empates o de
+      // MENOR texto (folha, mais específico) — evita casar um container-pai que engloba o alvo e um
+      // toast/overlay. Filtra offscreen/invisível.
+      function findByText(text) {
+        const t = normTxt(text); if (!t) return null;
+        const sel = "a,button,[role=button],[role=link],input[type=submit],input[type=button],summary,[role=menuitem],[role=tab],[role=option],[role=switch]";
+        const cands = [...document.querySelectorAll(sel)].filter((e) => visible(e) && onScreen(e));
+        const own = (e) => normTxt(e.textContent || e.value || "");
+        const pick = (arr) => arr.sort((a, b) => own(a).length - own(b).length)[0] || null;
+        return pick(cands.filter((e) => own(e) === t)) || pick(cands.filter((e) => own(e).startsWith(t))) || pick(cands.filter((e) => own(e).includes(t))) || null;
+      }
       function elRole(e) { try { return normTxt(e.getAttribute("role")) || ({ a: "link", button: "button", input: (e.type || "text"), select: "select", textarea: "textbox" }[e.tagName.toLowerCase()] || e.tagName.toLowerCase()); } catch (_) { return ""; } }
       // Re-resolve um ref OBSOLETO (SPA re-renderizou e apagou o data-cm-ref) pelo rótulo/role guardado no
       // mapa. É PROPOSITALMENTE conservador: prefere o mesmo role, exige match ÚNICO e só aceita substring
@@ -721,7 +779,7 @@
         if (!m) return null;
         const label = normTxt(m.label); if (!label || label.length < 2) return null; // rótulo vazio/curto demais é ambíguo
         let cands; try { cands = [...document.querySelectorAll(m.tag || "*")]; } catch (_) { cands = [...document.querySelectorAll("*")]; }
-        cands = cands.filter(visible);
+        cands = cands.filter((e) => visible(e) && onScreen(e));
         const wantRole = normTxt(m.role);
         const roleMatch = wantRole ? cands.filter((e) => elRole(e) === wantRole) : []; // desambigua por role guardado
         const pool = roleMatch.length ? roleMatch : cands;
@@ -756,6 +814,15 @@
       }
       function setVal(el, val) {
         el.focus();
+        // contenteditable (Quill/Notion): NÃO usar o setter de HTMLInputElement.value (dá "Illegal
+        // invocation"). Seleciona tudo e insere via execCommand (preserva o editor); fallback textContent.
+        if (!(el instanceof HTMLInputElement) && !(el instanceof HTMLTextAreaElement) && (el.isContentEditable || el.getAttribute("contenteditable") === "true")) {
+          try { const sel = document.getSelection(); const rg = document.createRange(); rg.selectNodeContents(el); sel.removeAllRanges(); sel.addRange(rg); } catch (_) {}
+          let ok = false; try { ok = document.execCommand("insertText", false, String(val)); } catch (_) {}
+          if (!ok) { try { el.textContent = String(val); } catch (_) {} }
+          el.dispatchEvent(new InputEvent("input", { inputType: "insertText", data: String(val), bubbles: true }));
+          return;
+        }
         const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
         const s = Object.getOwnPropertyDescriptor(proto, "value");
         if (s && s.set) s.set.call(el, val); else el.value = val;
@@ -805,13 +872,26 @@
           if (el.tagName === "INPUT" && el.type === "file") return { ok: false, error: "Este é um <input type=file>: clicar abriria o seletor de arquivos do sistema (trava o agente). Use browser_upload com o caminho do arquivo NESTE input, em vez de clicar." };
           try { document.documentElement.removeAttribute("data-cm-fileblocked"); } catch (_) {}
           try { document.documentElement.setAttribute("data-cm-driving", String(Date.now() + 4000)); } catch (_) {} // sinaliza ao supressor (mundo MAIN) que o clique é do Claude
+          const elInfo = { tag: el.tagName.toLowerCase(), role: el.getAttribute("role") || undefined, text: normTxt(el.textContent || el.value || "").slice(0, 60) }; // QUAL elemento foi o alvo
           const before = { url: location.href, n: document.body ? document.body.childElementCount : 0 };
-          cursorLabel(p.label || "Clicando"); const c = await moveTo(el); ripple(c.x, c.y); await sleep(110); el.click(); cursorLabel("");
-          if (p.nowait) return { ok: true, clicked: true, nowait: true }; // fire-and-forget: não espera a página assentar
+          cursorLabel(p.label || "Clicando"); const c = await moveTo(el); ripple(c.x, c.y); await sleep(110);
+          // Oclusão: um toast/overlay pode estar SOBRE o alvo — avisa se o topo no CENTRO real do
+          // elemento (relido agora) não é o alvo. Ignora os overlays da PRÓPRIA extensão (id __claudao*),
+          // senão o botão "Pausar esse agente" no topo-centro geraria aviso falso.
+          let occludedBy = null;
+          try {
+            const rr = el.getBoundingClientRect(); const cx = rr.left + rr.width / 2, cy = rr.top + rr.height / 2;
+            let top = document.elementFromPoint(cx, cy);
+            if (top && top.id && String(top.id).indexOf("__claudao") === 0) top = el; // nossa UI não conta como oclusão
+            if (top && top !== el && !el.contains(top) && !top.contains(el)) occludedBy = normTxt(top.textContent || "").slice(0, 60) || top.tagName.toLowerCase();
+          } catch (_) {}
+          el.click(); cursorLabel("");
+          if (p.nowait) return { ok: true, clicked: true, nowait: true, target: elInfo }; // fire-and-forget: não espera a página assentar
           await sleep(220);
           const navigated = location.href !== before.url;
           const changed = navigated || (document.body && document.body.childElementCount !== before.n);
-          const r = { ok: true, clicked: true, changed: !!changed, navigated };
+          const r = { ok: true, clicked: true, changed: !!changed, navigated, target: elInfo };
+          if (occludedBy) r.warning = "Havia outro elemento (toast/overlay: \"" + occludedBy + "\") sobre o alvo no ponto do clique — o efeito pode ter ido para ele. Confira 'changed'/'errors' ou feche o overlay antes.";
           if (document.documentElement.getAttribute("data-cm-fileblocked")) { r.filePickerBlocked = true; r.hint = "O clique tentaria abrir o seletor de arquivos do sistema (bloqueado para não travar). Use browser_upload com o caminho do arquivo no <input type=file> correspondente."; try { document.documentElement.removeAttribute("data-cm-fileblocked"); } catch (_) {} }
           const errs = detectErrors(); if (errs.length) r.errors = errs;
           return r;
@@ -821,14 +901,66 @@
           const el = await waitVisible(p); if (!el) return { ok: false, error: "campo não encontrado" };
           cursorLabel(op === "fill_secret" ? "Preenchendo •••" : "Preenchendo"); await moveTo(el); if (p.clearFirst) setVal(el, ""); setVal(el, p.value != null ? p.value : ""); cursorLabel("");
           const expected = p.value != null ? String(p.value) : "";
-          const verified = op === "fill_secret" ? (String(el.value || "").length === expected.length) : (String(el.value || "") === expected);
+          // contenteditable não tem .value → lê textContent (senão o verified vinha sempre false p/ rich text).
+          const isFieldEl = el.tagName === "INPUT" || el.tagName === "TEXTAREA";
+          const got = isFieldEl ? String(el.value || "") : String(el.textContent || "");
+          const verified = op === "fill_secret" ? (got.length === expected.length) : (got === expected);
           const r = { ok: true, filled: true, verified };
           const errs = detectErrors(); if (errs.length) r.errors = errs;
           return r;
         }
         if (op === "type") {
           const el = (p.selector || p.ref) ? await waitVisible(p) : document.activeElement; if (!el) return { ok: false, error: "sem elemento focado" };
-          cursorLabel("Digitando"); el.focus(); for (const ch of String(p.text || "")) { setVal(el, (el.value || "") + ch); await sleep(12); } cursorLabel(""); return { ok: true };
+          if (el.tagName === "INPUT" && el.type === "file") return { ok: false, error: "Este é um <input type=file>: digitar não anexa arquivo. Use browser_upload com o caminho do arquivo." };
+          const isField = el.tagName === "INPUT" || el.tagName === "TEXTAREA";
+          const isCE = !isField && (el.isContentEditable || el.getAttribute("contenteditable") === "true");
+          // Sem campo editável no foco (ex.: type sem selector e nada focado → activeElement é o <body>):
+          // não fingir sucesso digitando no body.
+          if (!isField && !isCE) return { ok: false, error: "o alvo não é um campo editável (input/textarea/contenteditable). Clique/foque um campo antes, ou passe selector/ref." };
+          const nativeSet = (node, val) => { const proto = node.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; const d = Object.getOwnPropertyDescriptor(proto, "value"); if (d && d.set) d.set.call(node, val); else node.value = val; };
+          const MAX = 8000; let txt = String(p.text != null ? p.text : ""); const truncated = txt.length > MAX; if (truncated) txt = txt.slice(0, MAX);
+          const delay = p.delay != null ? Math.max(0, Math.min(300, p.delay)) : 25;
+          // Inputs de valor RESTRITO (number/date/time/…): digitar char-a-char corrompe (o setter
+          // sanitiza cada valor intermediário inválido p/ "" e o final perde dígitos/sinal). Seta o
+          // valor COMPLETO de uma vez.
+          const restricted = isField && el.tagName === "INPUT" && /^(number|range|date|datetime-local|month|week|time|color)$/.test(el.type || "");
+          cursorLabel("Digitando"); el.focus();
+          if (restricted) {
+            try { nativeSet(el, txt); } catch (_) {}
+            el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true })); cursorLabel("");
+            return { ok: true, typed: txt.length, target: (el.type || "text"), value: String(el.value || "").slice(0, 200), truncated };
+          }
+          // Insere um caractere num contenteditable SEM destruir a estrutura do editor (nada de
+          // el.textContent=…, que apaga <p>/<span> internos). Preferência: execCommand → Range → append.
+          const insertCE = (ch) => {
+            try { if (document.execCommand("insertText", false, ch)) return true; } catch (_) {}
+            // Range só se estiver DENTRO do alvo (senão a seleção viva pode apontar p/ outro editável/body).
+            try { const sel = document.getSelection(); if (sel && sel.rangeCount) { const rg = sel.getRangeAt(0); if (el.contains(rg.commonAncestorContainer)) { rg.deleteContents(); const tn = document.createTextNode(ch); rg.insertNode(tn); rg.setStartAfter(tn); rg.collapse(true); sel.removeAllRanges(); sel.addRange(rg); return true; } } } catch (_) {}
+            try { el.appendChild(document.createTextNode(ch)); return true; } catch (_) {} // append no fim de el mantém a ordem e fica dentro do alvo
+            return false;
+          };
+          for (const ch of txt) {
+            // Sequência de teclas REAIS por caractere → dispara typeaheads (menções do LinkedIn etc.).
+            el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true, cancelable: true }));
+            try { el.dispatchEvent(new InputEvent("beforeinput", { data: ch, inputType: "insertText", bubbles: true, cancelable: true })); } catch (_) {}
+            if (isField) nativeSet(el, (el.value || "") + ch); else insertCE(ch);
+            try { el.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true })); } catch (_) { el.dispatchEvent(new Event("input", { bubbles: true })); }
+            el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
+            await sleep(delay);
+          }
+          if (isField) el.dispatchEvent(new Event("change", { bubbles: true }));
+          // Editores rich text (Quill): força o MODEL a sincronizar inserindo e removendo um espaço
+          // SÓ via execCommand (input events). NÃO dispara keydown de Backspace sintético — Quill 2.x
+          // tem binding de Backspace no keydown que apagaria um caractere REAL do texto (duplo delete).
+          if (isCE && p.syncEditor !== false) {
+            let spaceIn = false; try { spaceIn = document.execCommand("insertText", false, " "); } catch (_) {}
+            try { el.dispatchEvent(new InputEvent("input", { data: " ", inputType: "insertText", bubbles: true })); } catch (_) {}
+            await sleep(20);
+            if (spaceIn) { try { document.execCommand("delete", false); } catch (_) {} try { el.dispatchEvent(new InputEvent("input", { inputType: "deleteContentBackward", bubbles: true })); } catch (_) {} }
+          }
+          cursorLabel("");
+          const got = isField ? (el.value || "") : (el.textContent || "");
+          return { ok: true, typed: txt.length, target: isCE ? "contenteditable" : el.tagName.toLowerCase(), value: String(got).replace(/\s+/g, " ").trim().slice(0, 200), truncated };
         }
         if (op === "press") {
           const el = document.activeElement || document.body; const key = p.key;
@@ -1080,13 +1212,34 @@
     for (const k of kids) { const r = findFileInputNode(k); if (r) return r; }
     return 0;
   }
+  // Localiza um nó pelo nodeId na árvore piercing (p/ escopar a busca do input ao subárvore do selector).
+  function findNodeById(node, id) {
+    if (!node) return null;
+    if (node.nodeId === id) return node;
+    const kids = (node.children || []).concat(node.shadowRoots || [], node.contentDocument ? [node.contentDocument] : []);
+    for (const k of kids) { const r = findNodeById(k, id); if (r) return r; }
+    return null;
+  }
   // Upload de arquivo(s) num <input type=file> via CDP (caminhos locais).
   async function uploadFiles(tabId, selector, files) {
     return withDebugger(tabId, async (target) => {
       const { root } = await chrome.debugger.sendCommand(target, "DOM.getDocument", { depth: -1, pierce: true });
       const setFiles = async (nodeId) => { await chrome.debugger.sendCommand(target, "DOM.setFileInputFiles", { files, nodeId }); return { ok: true, uploaded: files.length }; };
-      // 1. tenta o selector do usuário; se resolver e for aceito como file input, usa.
-      if (selector) { try { const nid = (await chrome.debugger.sendCommand(target, "DOM.querySelector", { nodeId: root.nodeId, selector })).nodeId || 0; if (nid) { try { return await setFiles(nid); } catch (_) { /* não era file input → cai no fallback */ } } } catch (_) {} }
+      // 1. selector do usuário: se aponta pro próprio input, usa; se aponta pro BOTÃO/wrapper,
+      //    procura o <input type=file> DENTRO dele (inclui shadow DOM) antes da busca global.
+      if (selector) {
+        try {
+          const nid = (await chrome.debugger.sendCommand(target, "DOM.querySelector", { nodeId: root.nodeId, selector })).nodeId || 0;
+          if (nid) {
+            try { return await setFiles(nid); } catch (_) { /* não era file input em si → escopa a busca abaixo */ }
+            const scoped = findNodeById(root, nid);
+            const inScope = scoped ? findFileInputNode(scoped) : 0;
+            // Achou o input DENTRO do escopo do selector: se ele recusar, NÃO cai no global (que
+            // mandaria o arquivo pro primeiro input da página, possivelmente OUTRO alvo) — erra explícito.
+            if (inScope) { try { return await setFiles(inScope); } catch (e) { return { ok: false, error: "o <input type=file> no escopo do seletor recusou o arquivo: " + String((e && e.message) || e) }; } }
+          }
+        } catch (_) {}
+      }
       // 2. fallback: primeiro <input type=file> em QUALQUER lugar (light + shadow DOM + iframes).
       const walked = findFileInputNode(root);
       if (walked) { try { return await setFiles(walked); } catch (e) { return { ok: false, error: "input de arquivo encontrado, mas o navegador recusou: " + String((e && e.message) || e) }; } }
@@ -1151,7 +1304,7 @@
         const [r] = await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: (n, f) => (window.__claudaoNet || []).filter((e) => !f || (e.url || "").includes(f)).slice(-n), args: [a.limit || 60, a.filter || ""] });
         return { ok: true, result: r ? r.result : [] };
       }
-      case "eval": { if (!a.code) throw new Error("faltou 'code'"); return { ok: true, result: await evalInTab(tabId, a.code) }; }
+      case "eval": { if (!a.code) throw new Error("faltou 'code'"); return { ok: true, result: await evalInTab(tabId, a.code, a.timeoutMs) }; }
       case "screenshot": { return { ok: true, result: await screenshotTab(tabId, { fullPage: a.fullPage, selector: a.selector, maxWidth: a.maxWidth, format: a.format, quality: a.quality, redactPII: a.redactPII }) }; }
       case "look": {
         // Set-of-marks: marca os elementos, tira a foto (leve) com os números, devolve foto + mapa.
@@ -1172,7 +1325,7 @@
         const r = await agentExec(tabId, { op: "click", selector: a.selector, ref: a.ref, text: a.text, timeoutMs: a.timeoutMs, nowait: a.nowait }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error };
       }
       case "fill": { const r = await agentExec(tabId, { op: "fill", selector: a.selector, ref: a.ref, value: a.value, clearFirst: a.clearFirst }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error }; }
-      case "type": { const r = await agentExec(tabId, { op: "type", selector: a.selector, ref: a.ref, text: a.text }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error }; }
+      case "type": { const r = await agentExec(tabId, { op: "type", selector: a.selector, ref: a.ref, text: a.text, delay: a.delay, syncEditor: a.syncEditor }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error }; }
       case "press": { const r = await agentExec(tabId, { op: "press", key: a.key }); return { ok: true, result: r }; }
       case "hover": { const r = await agentExec(tabId, { op: "hover", selector: a.selector, ref: a.ref }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error }; }
       case "scroll": { const r = await agentExec(tabId, { op: "scroll", selector: a.selector, ref: a.ref, deltaY: a.deltaY, to: a.to }); return { ok: true, result: r }; }
@@ -1186,8 +1339,15 @@
           const tab = await chrome.tabs.create({ url: a.url, active: a.active !== false });
           return { ok: true, result: { openedNewTab: true, tabId: tab.id, url: a.url, keptWorkingTab: tabId || null } };
         }
+        // Navegação só-hash / mesma-URL (same-document) NÃO dispara load 'complete' → não esperar
+        // o timeout inteiro à toa. Compara path+search antes de navegar.
+        let curUrl = ""; try { const tb0 = await chrome.tabs.get(tabId); curUrl = tb0.url || ""; } catch (_) {}
+        let sameDoc = false; try { const u1 = new URL(a.url, curUrl || undefined), u0 = new URL(curUrl); sameDoc = u1.origin === u0.origin && u1.pathname === u0.pathname && u1.search === u0.search; } catch (_) {}
         await chrome.tabs.update(tabId, { url: a.url });
-        return { ok: true, result: { navigated: true, url: a.url } };
+        const load = sameDoc ? "same-document" : await waitTabComplete(tabId, a.timeoutMs || 15000); // espera carregar (não retorna a página anterior)
+        await new Promise((r) => setTimeout(r, sameDoc ? 120 : 350)); // settle p/ SPA renderizar antes do próximo snapshot
+        let finalUrl = a.url; try { const tb = await chrome.tabs.get(tabId); finalUrl = tb.url || a.url; } catch (_) {}
+        return { ok: true, result: { navigated: true, url: finalUrl, load } };
       }
       case "history": {
         if (a.action === "back") { try { await chrome.tabs.goBack(tabId); } catch (_) {} }
