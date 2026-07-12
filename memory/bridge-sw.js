@@ -83,21 +83,23 @@
         return;
       }
       if (!msg || !msg.cmd) return;
-      // "Parar Claude": se o usuário pausou (botão na tela ou assumiu o controle), recusa tudo.
-      {
-        let pv = null; try { pv = (await chrome.storage.local.get(PAUSE_KEY))[PAUSE_KEY]; } catch (_) {}
-        if (pv && pv.on) {
-          const why = pv.reason === "takeover" ? "O usuário ASSUMIU o controle (mexeu na página)" : "O usuário clicou em PARAR CLAUDE";
-          try { ws.send(JSON.stringify({ id: msg.id, ok: false, paused: true, error: why + ". A interação está PAUSADA por decisão do usuário. PARE agora: NÃO repita a chamada automaticamente. Pergunte a ele o que ajustar, ou espere ele clicar em Retomar (na página ou no painel)." })); } catch (_) {}
-          return;
-        }
-      }
       let reply, tabId = null, host = "";
       try {
         const TAB_CMDS = { read: 1, console: 1, eval: 1, screenshot: 1, click: 1, fill: 1, navigate: 1, query: 1, snapshot: 1, get_state: 1, network: 1, wait: 1, type: 1, press: 1, hover: 1, scroll: 1, select: 1, submit: 1, history: 1, login: 1, fill_secret: 1, upload: 1, move_cursor: 1, drag: 1, look: 1, mark: 1, inspect: 1, observe: 1 };
         const needsTab = !!TAB_CMDS[msg.cmd];
         tabId = needsTab ? await resolveTab(msg.args || {}) : null;
-        if (tabId) { try { const tb = await chrome.tabs.get(tabId); host = hostOf(tb.url || ""); } catch (_) {} }
+        let tabUrl = "";
+        if (tabId) { try { const tb = await chrome.tabs.get(tabId); tabUrl = tb.url || ""; host = hostOf(tabUrl); } catch (_) {} }
+        // "Parar Claude" GRANULAR: só recusa se ESTA aba está pausada. Outras abas seguem livres.
+        if (tabId && pausedTabs.has(tabId)) {
+          const info = pausedTabs.get(tabId) || {};
+          const why = info.reason === "takeover" ? "O usuário ASSUMIU o controle desta página" : "O usuário clicou em PARAR CLAUDE nesta página";
+          try { ws.send(JSON.stringify({ id: msg.id, ok: false, paused: true, tab: tabId, error: why + " (aba " + tabId + "). Esta aba está PAUSADA; NÃO repita a chamada. Outras abas seguem livres. Espere o usuário clicar em Retomar nesta página." })); } catch (_) {}
+          return;
+        }
+        // Página não-scriptável (Web Store, chrome://): avisa claro em vez do erro cru do Chrome.
+        const nsr = needsTab ? nonScriptableReason(tabUrl) : null;
+        if (nsr) { try { ws.send(JSON.stringify({ id: msg.id, ok: false, nonScriptable: true, error: "Página não-scriptável: " + nsr + ". NENHUMA automação (ver/ler/clicar/eval) é possível aqui — é restrição do Chrome, não do Claudão². Não insista; peça ao usuário para abrir a página em outra aba comum ou aja em outra aba." })); } catch (_) {} return; }
         // Gate de allowlist: ações só rodam em domínios aprovados (navigate/open_tab checam o destino).
         const a = msg.args || {};
         const gateHost = ((msg.cmd === "navigate" || msg.cmd === "open_tab") && a.url) ? hostOf(a.url) : host;
@@ -156,20 +158,13 @@
       const g = changes[GRANT_KEY].newValue;
       if (g && g.host && g.scope === "session") sessionConsent.add(g.host);
     }
-    // "Parar Claude": ao pausar, remove o glow e mostra a pílula "Retomar" nas abas;
-    // ao retomar (on:false), tira a pílula (o glow volta quando o Claude agir de novo).
+    // Pausa GRANULAR por aba: reconcilia o mapa {tabId→info} do storage com o estado do SW.
+    // Cobre "Retomar tudo" do painel e escritas de outras vias. Idempotente (não reage
+    // às próprias escritas do SW, pois pausedTabs já reflete o estado antes de persistir).
     if (changes[PAUSE_KEY]) {
-      const pv = changes[PAUSE_KEY].newValue;
-      pauseActive = !!(pv && pv.on);
-      if (pauseActive) {
-        clearTimeout(clearTimer);
-        for (const t of glowedTabs) { glow(t, false); showResume(t, true); pausedTabs.add(t); }
-        glowedTabs.clear();
-        try { chrome.storage.local.set({ [ACTIVE_KEY]: { active: false, ts: Date.now() } }); } catch (_) {}
-      } else {
-        for (const t of pausedTabs) { glow(t, false); showResume(t, false); } // limpa glow re-injetado num race + a pílula
-        pausedTabs.clear();
-      }
+      const tabs = (changes[PAUSE_KEY].newValue && changes[PAUSE_KEY].newValue.tabs) || {};
+      for (const t of [...pausedTabs.keys()]) { if (!(t in tabs)) { pausedTabs.delete(t); glow(t, false); showResume(t, false); } } // saíram da pausa
+      for (const id in tabs) { const tid = Number(id); if (!pausedTabs.has(tid)) { pausedTabs.set(tid, tabs[id]); glowedTabs.delete(tid); glow(tid, false); showResume(tid, true); } } // entraram na pausa
     }
   });
 
@@ -182,8 +177,14 @@
         vaultSave(msg.item).then((r) => sendResponse({ ok: true, result: r })).catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
         return true; // resposta assíncrona
       }
+      // Pausa/Retoma GRANULAR: a página não sabe seu tabId → o SW pega de sender.tab.id.
+      if (msg && msg.cm_pause && sender && sender.tab) { pauseTab(sender.tab.id, msg.reason); return; }
+      if (msg && msg.cm_resume && sender && sender.tab) { resumeTab(sender.tab.id); return; }
     });
   } catch (_) {}
+
+  // Aba fechada: limpa glow/pausa presa dela (evita entradas órfãs no storage).
+  try { chrome.tabs.onRemoved.addListener((tid) => { glowedTabs.delete(tid); if (pausedTabs.has(tid)) { pausedTabs.delete(tid); persistPausedTabs(); } }); } catch (_) {}
 
   try {
     chrome.alarms.create("cm_bridge_keepalive", { periodInMinutes: 0.5 });
@@ -209,14 +210,13 @@
   // usuário nunca ficar sem como retomar (o onChanged não dispara para estado já existente).
   (async () => {
     try {
-      const pv = (await chrome.storage.local.get(PAUSE_KEY))[PAUSE_KEY];
-      if (pv && pv.on) {
-        pauseActive = true;
-        // aba ativa de cada janela (onde o usuário está olhando) + fallback pra 1ª http(s)
-        let tabs = await chrome.tabs.query({ active: true, url: ["http://*/*", "https://*/*"] });
-        if (!tabs.length) tabs = (await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] })).slice(0, 1);
-        for (const t of tabs) { showResume(t.id, true); pausedTabs.add(t.id); }
+      const v = (await chrome.storage.local.get(PAUSE_KEY))[PAUSE_KEY];
+      const tabs = (v && v.tabs) || {};
+      for (const id in tabs) {
+        const tid = Number(id);
+        try { await chrome.tabs.get(tid); pausedTabs.set(tid, tabs[id]); showResume(tid, true); } catch (_) {} // aba ainda existe → re-mostra pílula
       }
+      if (Object.keys(tabs).length !== pausedTabs.size) await persistPausedTabs(); // limpa abas fechadas do storage
     } catch (_) {}
   })();
 
@@ -246,6 +246,14 @@
   // -------------------------------------------------------------------------
   const sessionConsent = new Set(); // domínios aprovados só nesta sessão do SW
   function hostOf(url) { try { return new URL(url).hostname.toLowerCase(); } catch (_) { return ""; } }
+  // Páginas que o Chrome NÃO deixa nenhuma extensão scriptar (restrição do navegador).
+  function nonScriptableReason(url) {
+    if (!url) return null;
+    if (/^(chrome|edge|brave|about|view-source|devtools|chrome-untrusted):/i.test(url)) return "página interna do navegador (chrome:// e afins)";
+    if (/^https?:\/\/chrome\.google\.com\/webstore/i.test(url) || /^https?:\/\/chromewebstore\.google\.com/i.test(url)) return "Chrome Web Store (galeria de extensões)";
+    if (/^https?:\/\/microsoftedge\.microsoft\.com\/addons/i.test(url)) return "galeria de extensões do Edge";
+    return null;
+  }
   function hostMatches(host, entry) {
     if (!host || !entry) return false;
     entry = String(entry).toLowerCase(); host = host.toLowerCase();
@@ -407,15 +415,34 @@
   // Atividade externa: glow na página + flag para o sidepanel
   // -------------------------------------------------------------------------
   const glowedTabs = new Set(); // TODAS as abas com glow (não uma só) — apaga todas ao encerrar
-  const pausedTabs = new Set(); // abas que receberam a pílula "Retomar" ao pausar
-  let pauseActive = false;      // espelho em memória do PAUSE_KEY (evita re-glow em aba pausada num race)
+  const pausedTabs = new Map(); // tabId → {reason, ts} : pausa GRANULAR por aba (pausar 1 não pausa as outras)
   let clearTimer = null;
   const GLOW_TTL_MS = 15000;    // overlay se auto-remove se não renovado (sobrevive à morte do SW)
 
   function unglowAll() { for (const t of glowedTabs) glow(t, false); glowedTabs.clear(); }
 
+  // Pausa GRANULAR por aba. A página não sabe o próprio tabId, então o botão/pílula
+  // manda uma mensagem e o SW resolve o tabId via sender.tab.id.
+  async function persistPausedTabs() {
+    const tabs = {}; for (const [t, info] of pausedTabs) tabs[t] = info || { ts: Date.now() };
+    try { await chrome.storage.local.set({ [PAUSE_KEY]: { tabs } }); } catch (_) {}
+  }
+  async function pauseTab(tabId, reason) {
+    if (!tabId || pausedTabs.has(tabId)) return;
+    pausedTabs.set(tabId, { reason: reason || "button", ts: Date.now() });
+    glowedTabs.delete(tabId);
+    await persistPausedTabs();
+    glow(tabId, false); showResume(tabId, true);
+  }
+  async function resumeTab(tabId) {
+    if (!tabId) return;
+    pausedTabs.delete(tabId);
+    await persistPausedTabs();
+    showResume(tabId, false);
+  }
+
   async function markActive(client, tabId) {
-    if (pauseActive) return; // pausado (mesmo num race pós-gate): não re-acende glow
+    if (tabId && pausedTabs.has(tabId)) return; // esta aba está pausada: não re-acende glow
     if (tabId) glowedTabs.add(tabId);
     try {
       await chrome.storage.local.set({ [ACTIVE_KEY]: { active: true, client: client || "Claude externo", tab: tabId || null, ts: Date.now() } });
@@ -444,7 +471,7 @@
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
-        func: (show, label, ttl, pauseKey) => {
+        func: (show, label, ttl) => {
           const IDS = ["__claudao_glow__", "__claudao_cursor__", "__claudao_marks__", "__claudao_stop__"];
           if (!show) {
             IDS.forEach((id) => { const e = document.getElementById(id); if (e) e.remove(); });
@@ -463,7 +490,7 @@
             const btn = document.createElement("button"); btn.id = "__claudao_stop__";
             btn.innerHTML = "⏹ Parar Claude" + (label ? " <span style='opacity:.7;font-weight:400'>· " + String(label).slice(0, 24) + "</span>" : "");
             btn.style.cssText = "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#c0392b;color:#fff;border:none;border-radius:9px;padding:8px 16px;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 3px 14px rgba(0,0,0,.45);pointer-events:auto;";
-            btn.onclick = (e) => { e.stopPropagation(); try { chrome.storage.local.set({ [pauseKey]: { on: true, ts: Date.now(), reason: "button" } }); } catch (_) {} btn.textContent = "Pausado"; btn.style.background = "#7a1f1f"; };
+            btn.onclick = (e) => { e.stopPropagation(); try { chrome.runtime.sendMessage({ cm_pause: true, reason: "button" }); } catch (_) {} btn.textContent = "Pausado"; btn.style.background = "#7a1f1f"; };
             (document.body || document.documentElement).appendChild(btn);
           }
           if (!window.__claudaoGlowInt) {
@@ -483,24 +510,24 @@
               if (!document.getElementById("__claudao_glow__")) return;      // só com glow ativo
               if (Date.now() > (window.__claudaoActUntil || 0)) return;      // só se o Claude agiu nos últimos ~2s
               if (Date.now() < (window.__claudaoSelfClick || 0)) return;     // ignora o CLIQUE REAL do próprio Claude (CDP também é isTrusted)
-              try { chrome.storage.local.set({ [pauseKey]: { on: true, ts: Date.now(), reason: "takeover" } }); } catch (_) {}
+              try { chrome.runtime.sendMessage({ cm_pause: true, reason: "takeover" }); } catch (_) {}
             };
             addEventListener("mousedown", onUser, true);
             addEventListener("keydown", onUser, true);
           }
         },
-        args: [!!on, client || "", GLOW_TTL_MS, PAUSE_KEY],
+        args: [!!on, client || "", GLOW_TTL_MS],
       });
     } catch (_) {}
   }
 
   // Pílula "▶ Retomar Claude" na própria página onde o usuário pausou (o "Retomar" do
-  // painel pode não estar visível se ele está olhando a aba alvo).
+  // painel pode não estar visível se ele está olhando a aba alvo). Escopo POR ABA.
   async function showResume(tabId, on) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
-        func: (show, pauseKey) => {
+        func: (show, myTabId, pauseKey) => {
           const ID = "__claudao_resume__";
           const old = document.getElementById(ID); if (old) old.remove();
           if (window.__claudaoResumeInt) { clearInterval(window.__claudaoResumeInt); window.__claudaoResumeInt = null; }
@@ -509,12 +536,12 @@
           btn.textContent = "▶ Retomar Claude";
           btn.style.cssText = "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#1f7a3a;color:#fff;border:none;border-radius:9px;padding:8px 16px;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 3px 14px rgba(0,0,0,.45);pointer-events:auto;";
           const kill = () => { const b = document.getElementById(ID); if (b) b.remove(); if (window.__claudaoResumeInt) { clearInterval(window.__claudaoResumeInt); window.__claudaoResumeInt = null; } };
-          btn.onclick = (e) => { e.stopPropagation(); try { chrome.storage.local.set({ [pauseKey]: { on: false, ts: Date.now() } }); } catch (_) {} kill(); };
+          btn.onclick = (e) => { e.stopPropagation(); try { chrome.runtime.sendMessage({ cm_resume: true }); } catch (_) {} kill(); };
           (document.body || document.documentElement).appendChild(btn);
-          // se a pausa for desligada por qualquer via (painel, outra aba, worker morto), some sozinha
-          window.__claudaoResumeInt = setInterval(() => { try { chrome.storage.local.get(pauseKey, (o) => { const v = o && o[pauseKey]; if (!v || !v.on) kill(); }); } catch (_) {} }, 1000);
+          // se ESTA aba sair da pausa por qualquer via (painel, worker morto), some sozinha
+          window.__claudaoResumeInt = setInterval(() => { try { chrome.storage.local.get(pauseKey, (o) => { const t = o && o[pauseKey] && o[pauseKey].tabs; if (!t || !t[myTabId]) kill(); }); } catch (_) {} }, 1000);
         },
-        args: [!!on, PAUSE_KEY],
+        args: [!!on, tabId, PAUSE_KEY],
       });
     } catch (_) {}
   }
@@ -648,10 +675,26 @@
         } catch (_) {}
       }
       function visible(el) { if (!el) return false; const r = el.getBoundingClientRect(); const cs = getComputedStyle(el); return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0"; }
+      function normTxt(s) { return (s || "").replace(/\s+/g, " ").trim().toLowerCase(); }
+      function findByText(text) { const t = normTxt(text); if (!t) return null; return [...document.querySelectorAll("a,button,[role=button],[role=link],input[type=submit],input[type=button],summary,[role=menuitem],[role=tab],[role=option]")].find((e) => normTxt(e.textContent || e.value || "").includes(t)) || null; }
+      // Re-resolve um ref OBSOLETO (SPA re-renderizou e apagou o data-cm-ref) pelo rótulo/role guardado no mapa.
+      function findByDescriptor(m) {
+        if (!m) return null;
+        const label = normTxt(m.label); if (!label) return null;
+        let cands; try { cands = [...document.querySelectorAll(m.tag || "*")]; } catch (_) { cands = [...document.querySelectorAll("*")]; }
+        cands = cands.filter(visible);
+        const val = (e) => normTxt(e.getAttribute && e.getAttribute("aria-label")) || normTxt(e.placeholder) || normTxt(e.name) || normTxt(e.value) || normTxt(e.textContent);
+        return cands.find((e) => normTxt(e.getAttribute && e.getAttribute("aria-label")) === label || normTxt(e.placeholder) === label || normTxt(e.name) === label)
+          || cands.find((e) => normTxt(e.textContent) === label)
+          || cands.find((e) => val(e).includes(label)) || null;
+      }
       function resolveEl(a) {
-        if (a.ref) { try { return document.querySelector('[data-cm-ref="' + a.ref + '"]'); } catch (_) { return null; } }
-        if (a.selector) { try { return document.querySelector(a.selector); } catch (_) { return null; } }
-        if (a.text) { const t = String(a.text).toLowerCase(); return [...document.querySelectorAll("a,button,[role=button],[role=link],input[type=submit],input[type=button],summary")].find((e) => ((e.textContent || e.value || "") + "").trim().toLowerCase().includes(t)) || null; }
+        if (a.ref) {
+          try { const byRef = document.querySelector('[data-cm-ref="' + a.ref + '"]'); if (byRef) return byRef; } catch (_) {}
+          const re = findByDescriptor((window.__claudaoRefMap || {})[a.ref]); if (re) return re; // ref obsoleto → re-resolve por rótulo
+        }
+        if (a.selector) { try { const s = document.querySelector(a.selector); if (s) return s; } catch (_) {} }
+        if (a.text) { const t = findByText(a.text); if (t) return t; }
         return null;
       }
       async function waitVisible(a, timeout) {
@@ -705,12 +748,13 @@
       const op = p.op;
       try {
         if (op === "click") {
-          await settleSpinner();
+          if (!p.nowait) await settleSpinner();
           const el = await waitVisible(p, p.timeoutMs); if (!el) return { ok: false, error: "elemento não encontrado" };
           if (el.tagName === "INPUT" && el.type === "file") return { ok: false, error: "Este é um <input type=file>: clicar abriria o seletor de arquivos do sistema (trava o agente). Use browser_upload com o caminho do arquivo NESTE input, em vez de clicar." };
           try { document.documentElement.removeAttribute("data-cm-fileblocked"); } catch (_) {}
           const before = { url: location.href, n: document.body ? document.body.childElementCount : 0 };
           cursorLabel(p.label || "Clicando"); const c = await moveTo(el); ripple(c.x, c.y); await sleep(110); el.click(); cursorLabel("");
+          if (p.nowait) return { ok: true, clicked: true, nowait: true }; // fire-and-forget: não espera a página assentar
           await sleep(220);
           const navigated = location.href !== before.url;
           const changed = navigated || (document.body && document.body.childElementCount !== before.n);
@@ -774,10 +818,29 @@
           await sleep(280); return { ok: true, scrollY: window.scrollY };
         }
         if (op === "select") {
-          const el = resolveEl(p); if (!el || el.tagName !== "SELECT") return { ok: false, error: "select não encontrado" };
-          let opt = null; if (p.value != null) opt = [...el.options].find((o) => o.value === p.value); if (!opt && p.label) opt = [...el.options].find((o) => (o.textContent || "").trim() === p.label);
-          if (!opt) return { ok: false, error: "opção não encontrada" };
-          el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true })); return { ok: true, selected: opt.value, verified: el.value === opt.value };
+          const el = resolveEl(p); if (!el) return { ok: false, error: "elemento (select/combobox) não encontrado" };
+          if (el.tagName === "SELECT") { // <select> nativo
+            let opt = null; if (p.value != null) opt = [...el.options].find((o) => o.value === p.value); if (!opt && p.label) opt = [...el.options].find((o) => (o.textContent || "").trim() === p.label);
+            if (!opt) return { ok: false, error: "opção não encontrada" };
+            el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true })); return { ok: true, selected: opt.value, verified: el.value === opt.value };
+          }
+          // Combobox CUSTOMIZADO (mat-select/cfc-select/[role=combobox]): abre e escolhe por texto, ATÔMICO
+          // (o overlay de opções costuma fechar entre tool calls; aqui é tudo num comando só).
+          const want = normTxt(p.label != null ? p.label : p.value);
+          if (!want) return { ok: false, error: "dropdown customizado: passe 'label' (ou 'value') com o TEXTO da opção" };
+          cursorLabel("Selecionando"); await moveTo(el); el.click();
+          const optSel = '[role=option],mat-option,cfc-select-option,cfc-option,li[role=option]';
+          let opt = null; const t0 = Date.now();
+          while (Date.now() - t0 < 3500) {
+            await sleep(120);
+            const opts = [...document.querySelectorAll(optSel)].filter(visible);
+            opt = opts.find((o) => normTxt(o.textContent) === want) || opts.find((o) => normTxt(o.textContent).includes(want));
+            if (opt) break;
+          }
+          cursorLabel("");
+          if (!opt) { const vis = [...document.querySelectorAll(optSel)].filter(visible).slice(0, 12).map((o) => (o.textContent || "").replace(/\s+/g, " ").trim()); return { ok: false, error: "dropdown aberto, mas '" + (p.label != null ? p.label : p.value) + "' não apareceu." + (vis.length ? " Opções visíveis: " + vis.join(" | ") : " Nenhuma opção visível (o overlay pode não ter aberto).") }; }
+          const cc = await moveTo(opt); ripple(cc.x, cc.y); await sleep(90); opt.click();
+          return { ok: true, selected: (opt.textContent || "").replace(/\s+/g, " ").trim() };
         }
         if (op === "submit") {
           const base = (p.selector || p.ref) ? resolveEl(p) : document.querySelector("form");
@@ -796,9 +859,10 @@
         }
         if (op === "snapshot") {
           document.querySelectorAll("[data-cm-ref]").forEach((e) => e.removeAttribute("data-cm-ref"));
-          const sel = "a[href],button,input,select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem],[onclick],[tabindex]";
+          window.__claudaoRefMap = {};
+          const sel = "a[href],button,input,select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem],[role=combobox],[role=listbox],[onclick],[tabindex],[aria-haspopup],mat-select,cfc-select,cfc-switcher-button";
           const els = [...document.querySelectorAll(sel)].filter(visible).slice(0, 120);
-          let i = 0; const out = els.map((e) => { const ref = "r" + (++i); e.setAttribute("data-cm-ref", ref); const r = e.getBoundingClientRect(); const label = (e.getAttribute("aria-label") || e.placeholder || (e.type === "password" ? "" : e.value) || (e.textContent || "").trim() || e.name || "").trim().slice(0, 70); const role = e.getAttribute("role") || ({ A: "link", BUTTON: "button", INPUT: (e.type || "text"), SELECT: "select", TEXTAREA: "textbox" }[e.tagName] || e.tagName.toLowerCase()); return { ref, role, label, x: Math.round(r.x), y: Math.round(r.y) }; });
+          let i = 0; const out = els.map((e) => { const ref = "r" + (++i); e.setAttribute("data-cm-ref", ref); const r = e.getBoundingClientRect(); const label = (e.getAttribute("aria-label") || e.placeholder || (e.type === "password" ? "" : e.value) || (e.textContent || "").trim() || e.name || "").trim().slice(0, 70); const role = e.getAttribute("role") || ({ A: "link", BUTTON: "button", INPUT: (e.type || "text"), SELECT: "select", TEXTAREA: "textbox" }[e.tagName] || e.tagName.toLowerCase()); window.__claudaoRefMap[ref] = { label, role, tag: e.tagName.toLowerCase() }; return { ref, role, label, x: Math.round(r.x), y: Math.round(r.y) }; });
           return { ok: true, url: location.href, title: document.title, elements: out };
         }
         if (op === "get_state") {
@@ -853,11 +917,12 @@
           const old = document.getElementById(CMK); if (old) old.remove();
           // limpa refs obsoletos de marcações anteriores (evita ref antigo colar em elemento errado)
           document.querySelectorAll("[data-cm-ref]").forEach((e) => e.removeAttribute("data-cm-ref"));
+          window.__claudaoRefMap = {}; // mapa ref→{label,role,tag} para re-resolver se o SPA re-renderizar
           if (op === "unmark") return { ok: true, unmarked: true };
           const box = document.createElement("div"); box.id = CMK;
           box.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483646;";
           document.documentElement.appendChild(box);
-          const sel = "a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem],[role=switch],[role=radio],[onclick],[contenteditable=true],[tabindex]";
+          const sel = "a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem],[role=switch],[role=radio],[role=combobox],[role=listbox],[role=option],[onclick],[contenteditable=true],[tabindex],[aria-haspopup=listbox],[aria-haspopup=menu],[aria-haspopup=true],mat-select,cfc-select,cfc-switcher-button";
           // só elementos DENTRO da dobra (o badge é fixed no viewport e a foto do look é do viewport)
           const inVp = (e) => { const r = e.getBoundingClientRect(); return r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth; };
           const seen = new Set();
@@ -869,6 +934,7 @@
             const val = e.type === "password" ? "" : e.value; // nunca expor senha no rótulo
             const label = (e.getAttribute("aria-label") || e.placeholder || val || (e.textContent || "").trim() || e.name || "").replace(/\s+/g, " ").trim().slice(0, 60);
             const role = e.getAttribute("role") || ({ A: "link", BUTTON: "button", INPUT: (e.type || "text"), SELECT: "select", TEXTAREA: "textbox" }[e.tagName] || e.tagName.toLowerCase());
+            window.__claudaoRefMap[ref] = { label, role, tag: e.tagName.toLowerCase() };
             const ol = document.createElement("div");
             ol.style.cssText = "position:fixed;left:" + r.left + "px;top:" + r.top + "px;width:" + r.width + "px;height:" + r.height + "px;border:1.5px solid rgba(255,59,59,.55);border-radius:3px;box-sizing:border-box;pointer-events:none;";
             const badge = document.createElement("div"); badge.textContent = i;
@@ -1023,7 +1089,7 @@
       // --- Ação (via agente de página, com cursor) ---
       case "click": {
         if (a.real) { const r = await realClick(tabId, a); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error }; }
-        const r = await agentExec(tabId, { op: "click", selector: a.selector, ref: a.ref, text: a.text, timeoutMs: a.timeoutMs }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error };
+        const r = await agentExec(tabId, { op: "click", selector: a.selector, ref: a.ref, text: a.text, timeoutMs: a.timeoutMs, nowait: a.nowait }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error };
       }
       case "fill": { const r = await agentExec(tabId, { op: "fill", selector: a.selector, ref: a.ref, value: a.value, clearFirst: a.clearFirst }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error }; }
       case "type": { const r = await agentExec(tabId, { op: "type", selector: a.selector, ref: a.ref, text: a.text }); return r.ok ? { ok: true, result: r } : { ok: false, error: r.error }; }

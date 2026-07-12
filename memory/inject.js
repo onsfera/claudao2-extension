@@ -1070,9 +1070,9 @@
     lock.innerHTML = "<span>" + ico("cpu", 15) + " " + t("ext_waiting") + "</span>";
     shadow.appendChild(lock);
     const pause = h("div", { id: "cm-pausebar", style: "display:none" });
-    pause.innerHTML = "<span>⏸ " + t("paused_by_you") + "</span>";
+    pause.innerHTML = '<span>⏸ ' + t("paused_by_you") + '<span class="cm-pause-count"></span></span>';
     const resume = h("button", { className: "cm-pause-resume", textContent: t("resume") });
-    resume.addEventListener("click", () => { try { chrome.storage.local.set({ [PAUSE_KEY]: { on: false, ts: Date.now() } }); } catch (_) {} });
+    resume.addEventListener("click", () => { try { chrome.storage.local.set({ [PAUSE_KEY]: { tabs: {} } }); } catch (_) {} }); // "Retomar tudo"
     pause.appendChild(resume);
     shadow.appendChild(pause);
   }
@@ -1080,7 +1080,8 @@
     if (!IS_SIDEPANEL || !shadow) return;
     ensureExternalUI();
     const bar = shadow.getElementById("cm-pausebar");
-    if (bar) bar.style.display = (st && st.on) ? "flex" : "none";
+    const n = st && st.tabs ? Object.keys(st.tabs).length : 0;
+    if (bar) { bar.style.display = n ? "flex" : "none"; const c = bar.querySelector(".cm-pause-count"); if (c) c.textContent = n > 1 ? " · " + n + " páginas" : ""; }
   }
   async function pollPaused() {
     if (!IS_SIDEPANEL) return;
