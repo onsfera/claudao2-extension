@@ -7,6 +7,8 @@ Fork da extensão **Claude in Chrome** (Anthropic) com duas camadas próprias:
 
 > Versão modificada de uso próprio, construída sobre a extensão oficial da Anthropic, com o disclaimer original mantido.
 
+Notas técnicas (arquitetura, 42 tools MCP, segurança) em EN e PT: [`TECHNICAL-NOTES.md`](TECHNICAL-NOTES.md).
+
 ---
 
 ## Instalar a extensão
