@@ -661,6 +661,10 @@
 
   async function evalInTab(tabId, code, timeoutMs) {
     const ms = Math.max(1000, Math.min(590000, timeoutMs || 30000)); // padrão 30s; teto ~10min
+    // eval roda com userGesture:true → um input.click()/showPicker() DENTRO do código abriria o
+    // seletor NATIVO de arquivos (trava). Marca "Claude dirigindo" (data-cm-driving) p/ o supressor
+    // do mundo MAIN bloquear isso — sem esse marcador, o eval é indistinguível de um clique do usuário.
+    try { await chrome.scripting.executeScript({ target: { tabId }, func: () => { try { document.documentElement.setAttribute("data-cm-driving", String(Date.now() + 8000)); } catch (_) {} } }); } catch (_) {}
     return withDebugger(tabId, async (target) => {
       const r = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
         expression: code, returnByValue: true, awaitPromise: true, userGesture: true, allowUnsafeEvalBlockedByCSP: true,
