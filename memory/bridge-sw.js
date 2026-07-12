@@ -512,9 +512,9 @@
           // Restaura o sinal DA ABA (favicon + título) ao valor original.
           const cmClearTab = () => {
             if (window.__claudaoTabInt) { clearInterval(window.__claudaoTabInt); window.__claudaoTabInt = null; }
-            try { document.title = document.title.replace(/^🔴 /, ""); } catch (_) {}
+            try { document.title = document.title.replace(/^✳ /, ""); } catch (_) {}
             try { const h = window.__claudaoTabSaved && window.__claudaoTabSaved.fav; document.querySelectorAll('link[rel~="icon"][data-cm-fav]').forEach((l) => { if (h != null) l.href = h; l.removeAttribute("data-cm-fav"); }); } catch (_) {}
-            window.__claudaoTabSaved = null; window.__claudaoTabBlink = false;
+            window.__claudaoTabSaved = null;
           };
           if (!show) {
             IDS.forEach((id) => { const e = document.getElementById(id); if (e) e.remove(); });
@@ -546,20 +546,33 @@
               }
             }, 3000);
           }
-          // Sinal NA ABA (barra de abas): favicon PISCANDO em vermelho + marcador no título, pra dar
-          // pra ver de relance QUAIS abas o Claude está mexendo. Segue o mesmo TTL do glow.
+          // Sinal NA ABA (barra de abas): favicon com a LOGOMARCA DO CLAUDE (sunburst laranja) GIRANDO
+          // suavemente + marcador no título, pra ver de relance QUAIS abas o Claude está mexendo.
+          // Segue o mesmo TTL do glow; restaura o favicon/título originais ao pausar/terminar.
           if (!window.__claudaoTabSaved) { const f = document.querySelector('link[rel~="icon"]'); window.__claudaoTabSaved = { fav: f ? f.href : null }; }
-          if (!window.__claudaoDot) { try { const c = document.createElement("canvas"); c.width = c.height = 32; const x = c.getContext("2d"); x.beginPath(); x.arc(16, 16, 13, 0, Math.PI * 2); x.fillStyle = "#ff3b3b"; x.fill(); x.lineWidth = 2.5; x.strokeStyle = "#fff"; x.stroke(); window.__claudaoDot = c.toDataURL("image/png"); } catch (_) { window.__claudaoDot = null; } }
-          window.__claudaoBlank = window.__claudaoBlank || "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+          if (!window.__claudaoLogo) {
+            window.__claudaoLogo = (rot) => {
+              try {
+                const c = document.createElement("canvas"); const S = 32; c.width = c.height = S; const x = c.getContext("2d");
+                x.clearRect(0, 0, S, S); x.save(); x.translate(S / 2, S / 2); x.rotate(rot);
+                x.strokeStyle = "#D97757"; x.lineCap = "round"; x.lineWidth = S * 0.09; // raios do sunburst (laranja Claude)
+                const R = [0.43, 0.28, 0.40, 0.26, 0.42, 0.29, 0.43, 0.27, 0.41, 0.28, 0.42, 0.27]; // raios de comprimentos variados (orgânico, como a marca do Claude); máx 0.43 p/ o cap arredondado não cortar na borda
+                for (let i = 0; i < 12; i++) { const a = (i / 12) * Math.PI * 2 - Math.PI / 2; const len = S * R[i]; const inr = S * 0.05; x.beginPath(); x.moveTo(Math.cos(a) * inr, Math.sin(a) * inr); x.lineTo(Math.cos(a) * len, Math.sin(a) * len); x.stroke(); }
+                x.restore(); return c.toDataURL("image/png");
+              } catch (_) { return null; }
+            };
+          }
           const cmSetFav = (href) => { if (href == null) return; let links = document.querySelectorAll('link[rel~="icon"]'); if (!links.length) { const l = document.createElement("link"); l.rel = "icon"; (document.head || document.documentElement).appendChild(l); links = document.querySelectorAll('link[rel~="icon"]'); } links.forEach((l) => { l.setAttribute("data-cm-fav", "1"); if (l.href !== href) l.href = href; }); };
-          if (window.__claudaoDot && !window.__claudaoTabInt) {
-            window.__claudaoTabBlink = false;
-            window.__claudaoTabInt = setInterval(() => {
+          if (!window.__claudaoTabInt) {
+            window.__claudaoTabRot = 0;
+            const tick = () => {
               if (Date.now() - (window.__claudaoGlowTs || 0) > (ttl || 15000)) { cmClearTab(); return; }
-              window.__claudaoTabBlink = !window.__claudaoTabBlink;
-              cmSetFav(window.__claudaoTabBlink ? window.__claudaoDot : ((window.__claudaoTabSaved && window.__claudaoTabSaved.fav) || window.__claudaoBlank));
-              try { document.title = "🔴 " + document.title.replace(/^🔴 /, ""); } catch (_) {} // marcador estático (re-aplica p/ sobreviver a SPA)
-            }, 700);
+              window.__claudaoTabRot = (window.__claudaoTabRot + 0.3) % (Math.PI * 2);
+              const f = window.__claudaoLogo(window.__claudaoTabRot); if (f) cmSetFav(f);
+              try { document.title = "✳ " + document.title.replace(/^✳ /, ""); } catch (_) {} // marcador (re-aplica p/ sobreviver a SPA)
+            };
+            tick(); // aplica de imediato (não espera o 1º intervalo)
+            window.__claudaoTabInt = setInterval(tick, 160);
           }
           // auto-pausa: input REAL do usuário com glow ativo = "assumi o controle"
           if (!window.__claudaoTakeoverBound) {
