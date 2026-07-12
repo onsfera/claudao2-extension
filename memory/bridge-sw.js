@@ -45,6 +45,23 @@
   const HANDOFF_KEY = "cm_handoff";         // passagem de tarefa Claude-editor <-> Claude-navegador
   const DEFAULT_ALLOW = ["localhost", "127.0.0.1"];
   const ACTIVE_IDLE_MS = 12000;             // trava/banner só somem após esse ocioso (evita piscar entre comandos)
+
+  // Textos dos botões injetados NA PÁGINA (o SW não usa o i18n do painel). Seguem o
+  // idioma nativo do Claude (preferred_locale) → uiLang, atualizado no init e no onChanged.
+  const PAGE_STR = {
+    pt: { pause: "Pausar esse agente", paused: "Pausado", resume: "Retomar agente" },
+    en: { pause: "Pause this agent", paused: "Paused", resume: "Resume agent" },
+    es: { pause: "Pausar este agente", paused: "Pausado", resume: "Reanudar agente" },
+  };
+  let uiLang = "pt";
+  // Barreira de hidratação: o gate de pausa (ws.onmessage) espera o pausedTabs ser repovoado
+  // do storage após um restart do SW, senão um comando poderia passar numa aba pausada.
+  let __hydrateResolve; const hydrationReady = new Promise((r) => { __hydrateResolve = r; });
+  function normLang(s) { s = String(s || "").toLowerCase(); return s.startsWith("es") ? "es" : s.startsWith("en") ? "en" : s.startsWith("pt") ? "pt" : null; }
+  async function refreshUiLang() {
+    try { const l = (await chrome.storage.local.get("preferred_locale"))["preferred_locale"]; const n = normLang(l); if (n) { uiLang = n; return; } } catch (_) {}
+    try { const n = normLang(chrome.i18n.getUILanguage()); if (n) uiLang = n; } catch (_) {}
+  }
   // Comandos que MODIFICAM/interagem (exigem domínio aprovado). Percepção é livre.
   const ACTION_CMDS = { click: 1, fill: 1, type: 1, press: 1, hover: 1, scroll: 1, select: 1, submit: 1, navigate: 1, history: 1, login: 1, fill_secret: 1, upload: 1, drag: 1, open_tab: 1 };
 
@@ -88,8 +105,9 @@
         const TAB_CMDS = { read: 1, console: 1, eval: 1, screenshot: 1, click: 1, fill: 1, navigate: 1, query: 1, snapshot: 1, get_state: 1, network: 1, wait: 1, type: 1, press: 1, hover: 1, scroll: 1, select: 1, submit: 1, history: 1, login: 1, fill_secret: 1, upload: 1, move_cursor: 1, drag: 1, look: 1, mark: 1, inspect: 1, observe: 1 };
         const needsTab = !!TAB_CMDS[msg.cmd];
         tabId = needsTab ? await resolveTab(msg.args || {}) : null;
+        await hydrationReady;   // após restart do SW, espera o pausedTabs repovoar antes de checar a pausa
         let tabUrl = "";
-        if (tabId) { try { const tb = await chrome.tabs.get(tabId); tabUrl = tb.url || ""; host = hostOf(tabUrl); } catch (_) {} }
+        if (tabId) { try { const tb = await chrome.tabs.get(tabId); tabUrl = tb.url || tb.pendingUrl || ""; host = hostOf(tabUrl); } catch (_) {} }
         // "Parar Claude" GRANULAR: só recusa se ESTA aba está pausada. Outras abas seguem livres.
         if (tabId && pausedTabs.has(tabId)) {
           const info = pausedTabs.get(tabId) || {};
@@ -110,7 +128,16 @@
           await markActive(msg.client, tabId);      // glow + flag ANTES de agir
           // Trava por aba: comandos na MESMA aba serializam (evita colisão de
           // debugger/DOM entre editores); abas diferentes seguem em paralelo.
-          reply = await withTabLock(tabId, () => exec(msg, tabId, host));
+          // Re-checa a pausa DENTRO da trava: o comando pode ter esperado na fila
+          // vários segundos e o usuário ter pausado a aba nesse meio-tempo (TOCTOU).
+          reply = await withTabLock(tabId, () => {
+            if (tabId && pausedTabs.has(tabId)) {
+              const info = pausedTabs.get(tabId) || {};
+              const why = info.reason === "takeover" ? "O usuário ASSUMIU o controle desta página" : "O usuário clicou em PARAR CLAUDE nesta página";
+              return { ok: false, paused: true, tab: tabId, error: why + " (aba " + tabId + "). Esta aba está PAUSADA; NÃO repita a chamada. Outras abas seguem livres. Espere o usuário clicar em Retomar nesta página." };
+            }
+            return exec(msg, tabId, host);
+          });
           // redação: mascara segredos conhecidos em qualquer retorno textual. No look,
           // redige o texto (elements/url/title) mas preserva o dataUrl (não varre o base64).
           if (reply && reply.ok && reply.result !== undefined && msg.cmd !== "screenshot") {
@@ -152,6 +179,7 @@
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
+    if (changes["preferred_locale"]) refreshUiLang(); // idioma nativo do Claude mudou → botões da página seguem junto
     if (changes[ENABLED_KEY]) applyEnabled(changes[ENABLED_KEY].newValue && changes[ENABLED_KEY].newValue.on);
     // O painel aprovou "só nesta sessão" um domínio → guarda em memória do SW.
     if (changes[GRANT_KEY] && changes[GRANT_KEY].newValue) {
@@ -194,6 +222,8 @@
   } catch (_) {}
   try { chrome.runtime.onStartup.addListener(() => { if (enabled) connect(); }); } catch (_) {}
 
+  refreshUiLang(); // idioma dos botões injetados na página (Pausar/Retomar), do preferred_locale
+
   // Estado inicial: LIGADO por padrão (o VS Code chama a extensão sem o usuário
   // precisar abrir nada). Fica gravado; o usuário pode desligar na tela Conectar.
   (async () => {
@@ -212,11 +242,16 @@
     try {
       const v = (await chrome.storage.local.get(PAUSE_KEY))[PAUSE_KEY];
       const tabs = (v && v.tabs) || {};
-      for (const id in tabs) {
-        const tid = Number(id);
-        try { await chrome.tabs.get(tid); pausedTabs.set(tid, tabs[id]); showResume(tid, true); } catch (_) {} // aba ainda existe → re-mostra pílula
+      // Popula o Map ANTES de qualquer await por-aba: fecha a janela em que o gate leria pausedTabs vazio.
+      for (const id in tabs) pausedTabs.set(Number(id), tabs[id]);
+    } catch (_) {}
+    finally { __hydrateResolve(); } // libera o gate assim que o Map reflete o storage
+    // Agora (já seguro) limpa abas fechadas e re-mostra a pílula "Retomar" nas que existem.
+    try {
+      for (const tid of [...pausedTabs.keys()]) {
+        try { await chrome.tabs.get(tid); showResume(tid, true); } catch (_) { pausedTabs.delete(tid); } // aba sumiu → tira da pausa
       }
-      if (Object.keys(tabs).length !== pausedTabs.size) await persistPausedTabs(); // limpa abas fechadas do storage
+      await persistPausedTabs(); // sincroniza storage (remove abas fechadas)
     } catch (_) {}
   })();
 
@@ -249,7 +284,8 @@
   // Páginas que o Chrome NÃO deixa nenhuma extensão scriptar (restrição do navegador).
   function nonScriptableReason(url) {
     if (!url) return null;
-    if (/^(chrome|edge|brave|about|view-source|devtools|chrome-untrusted):/i.test(url)) return "página interna do navegador (chrome:// e afins)";
+    // chrome-extension:// e chrome-search:// precisam vir na alternância (o '-' quebra o \b após 'chrome').
+    if (/^(chrome-extension|chrome-search|chrome-untrusted|chrome|edge|brave|about|view-source|devtools):/i.test(url)) return "página interna do navegador (chrome://, chrome-extension://, view-source: e afins)";
     if (/^https?:\/\/chrome\.google\.com\/webstore/i.test(url) || /^https?:\/\/chromewebstore\.google\.com/i.test(url)) return "Chrome Web Store (galeria de extensões)";
     if (/^https?:\/\/microsoftedge\.microsoft\.com\/addons/i.test(url)) return "galeria de extensões do Edge";
     return null;
@@ -471,7 +507,7 @@
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
-        func: (show, label, ttl) => {
+        func: (show, label, ttl, str) => {
           const IDS = ["__claudao_glow__", "__claudao_cursor__", "__claudao_marks__", "__claudao_stop__"];
           if (!show) {
             IDS.forEach((id) => { const e = document.getElementById(id); if (e) e.remove(); });
@@ -488,9 +524,9 @@
           }
           if (!document.getElementById("__claudao_stop__")) {
             const btn = document.createElement("button"); btn.id = "__claudao_stop__";
-            btn.innerHTML = "⏹ Parar Claude" + (label ? " <span style='opacity:.7;font-weight:400'>· " + String(label).slice(0, 24) + "</span>" : "");
+            btn.innerHTML = "⏸ " + str.pause + (label ? " <span style='opacity:.7;font-weight:400'>· " + String(label).slice(0, 24) + "</span>" : "");
             btn.style.cssText = "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#c0392b;color:#fff;border:none;border-radius:9px;padding:8px 16px;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 3px 14px rgba(0,0,0,.45);pointer-events:auto;";
-            btn.onclick = (e) => { e.stopPropagation(); try { chrome.runtime.sendMessage({ cm_pause: true, reason: "button" }); } catch (_) {} btn.textContent = "Pausado"; btn.style.background = "#7a1f1f"; };
+            btn.onclick = (e) => { e.stopPropagation(); try { chrome.runtime.sendMessage({ cm_pause: true, reason: "button" }); } catch (_) {} btn.textContent = str.paused; btn.style.background = "#7a1f1f"; };
             (document.body || document.documentElement).appendChild(btn);
           }
           if (!window.__claudaoGlowInt) {
@@ -516,7 +552,7 @@
             addEventListener("keydown", onUser, true);
           }
         },
-        args: [!!on, client || "", GLOW_TTL_MS],
+        args: [!!on, client || "", GLOW_TTL_MS, PAGE_STR[uiLang]],
       });
     } catch (_) {}
   }
@@ -527,13 +563,13 @@
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
-        func: (show, myTabId, pauseKey) => {
+        func: (show, myTabId, pauseKey, resumeLabel) => {
           const ID = "__claudao_resume__";
           const old = document.getElementById(ID); if (old) old.remove();
           if (window.__claudaoResumeInt) { clearInterval(window.__claudaoResumeInt); window.__claudaoResumeInt = null; }
           if (!show) return;
           const btn = document.createElement("button"); btn.id = ID;
-          btn.textContent = "▶ Retomar Claude";
+          btn.textContent = "▶ " + resumeLabel;
           btn.style.cssText = "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#1f7a3a;color:#fff;border:none;border-radius:9px;padding:8px 16px;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 3px 14px rgba(0,0,0,.45);pointer-events:auto;";
           const kill = () => { const b = document.getElementById(ID); if (b) b.remove(); if (window.__claudaoResumeInt) { clearInterval(window.__claudaoResumeInt); window.__claudaoResumeInt = null; } };
           btn.onclick = (e) => { e.stopPropagation(); try { chrome.runtime.sendMessage({ cm_resume: true }); } catch (_) {} kill(); };
@@ -541,7 +577,7 @@
           // se ESTA aba sair da pausa por qualquer via (painel, worker morto), some sozinha
           window.__claudaoResumeInt = setInterval(() => { try { chrome.storage.local.get(pauseKey, (o) => { const t = o && o[pauseKey] && o[pauseKey].tabs; if (!t || !t[myTabId]) kill(); }); } catch (_) {} }, 1000);
         },
-        args: [!!on, tabId, PAUSE_KEY],
+        args: [!!on, tabId, PAUSE_KEY, PAGE_STR[uiLang].resume],
       });
     } catch (_) {}
   }
@@ -677,21 +713,37 @@
       function visible(el) { if (!el) return false; const r = el.getBoundingClientRect(); const cs = getComputedStyle(el); return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0"; }
       function normTxt(s) { return (s || "").replace(/\s+/g, " ").trim().toLowerCase(); }
       function findByText(text) { const t = normTxt(text); if (!t) return null; return [...document.querySelectorAll("a,button,[role=button],[role=link],input[type=submit],input[type=button],summary,[role=menuitem],[role=tab],[role=option]")].find((e) => normTxt(e.textContent || e.value || "").includes(t)) || null; }
-      // Re-resolve um ref OBSOLETO (SPA re-renderizou e apagou o data-cm-ref) pelo rótulo/role guardado no mapa.
+      function elRole(e) { try { return normTxt(e.getAttribute("role")) || ({ a: "link", button: "button", input: (e.type || "text"), select: "select", textarea: "textbox" }[e.tagName.toLowerCase()] || e.tagName.toLowerCase()); } catch (_) { return ""; } }
+      // Re-resolve um ref OBSOLETO (SPA re-renderizou e apagou o data-cm-ref) pelo rótulo/role guardado no
+      // mapa. É PROPOSITALMENTE conservador: prefere o mesmo role, exige match ÚNICO e só aceita substring
+      // se o rótulo for distintivo — ambiguidade retorna null (melhor "não achei" que clicar no errado).
       function findByDescriptor(m) {
         if (!m) return null;
-        const label = normTxt(m.label); if (!label) return null;
+        const label = normTxt(m.label); if (!label || label.length < 2) return null; // rótulo vazio/curto demais é ambíguo
         let cands; try { cands = [...document.querySelectorAll(m.tag || "*")]; } catch (_) { cands = [...document.querySelectorAll("*")]; }
         cands = cands.filter(visible);
-        const val = (e) => normTxt(e.getAttribute && e.getAttribute("aria-label")) || normTxt(e.placeholder) || normTxt(e.name) || normTxt(e.value) || normTxt(e.textContent);
-        return cands.find((e) => normTxt(e.getAttribute && e.getAttribute("aria-label")) === label || normTxt(e.placeholder) === label || normTxt(e.name) === label)
-          || cands.find((e) => normTxt(e.textContent) === label)
-          || cands.find((e) => val(e).includes(label)) || null;
+        const wantRole = normTxt(m.role);
+        const roleMatch = wantRole ? cands.filter((e) => elRole(e) === wantRole) : []; // desambigua por role guardado
+        const pool = roleMatch.length ? roleMatch : cands;
+        const exact = (e) => normTxt(e.getAttribute && e.getAttribute("aria-label")) === label || normTxt(e.placeholder) === label || normTxt(e.name) === label || normTxt(e.textContent) === label;
+        const exacts = pool.filter(exact);
+        if (exacts.length === 1) return exacts[0];   // igualdade exata e ÚNICA
+        if (exacts.length > 1) return null;          // ambíguo: não arrisca
+        if (label.length >= 4) {                      // substring só p/ rótulo distintivo E match único
+          const val = (e) => normTxt(e.getAttribute && e.getAttribute("aria-label")) || normTxt(e.placeholder) || normTxt(e.name) || normTxt(e.value) || normTxt(e.textContent);
+          const subs = pool.filter((e) => val(e).includes(label));
+          if (subs.length === 1) return subs[0];
+        }
+        return null;
       }
       function resolveEl(a) {
         if (a.ref) {
           try { const byRef = document.querySelector('[data-cm-ref="' + a.ref + '"]'); if (byRef) return byRef; } catch (_) {}
-          const re = findByDescriptor((window.__claudaoRefMap || {})[a.ref]); if (re) return re; // ref obsoleto → re-resolve por rótulo
+          // ref obsoleto → re-resolve por rótulo SÓ se ainda estamos na MESMA tela (mesma URL da captura).
+          // Após navegação SPA (pushState) o mapa é de outra tela e re-resolver colaria no elemento errado.
+          if (!window.__claudaoRefUrl || window.__claudaoRefUrl === location.href) {
+            const re = findByDescriptor((window.__claudaoRefMap || {})[a.ref]); if (re) return re;
+          }
         }
         if (a.selector) { try { const s = document.querySelector(a.selector); if (s) return s; } catch (_) {} }
         if (a.text) { const t = findByText(a.text); if (t) return t; }
@@ -752,6 +804,7 @@
           const el = await waitVisible(p, p.timeoutMs); if (!el) return { ok: false, error: "elemento não encontrado" };
           if (el.tagName === "INPUT" && el.type === "file") return { ok: false, error: "Este é um <input type=file>: clicar abriria o seletor de arquivos do sistema (trava o agente). Use browser_upload com o caminho do arquivo NESTE input, em vez de clicar." };
           try { document.documentElement.removeAttribute("data-cm-fileblocked"); } catch (_) {}
+          try { document.documentElement.setAttribute("data-cm-driving", String(Date.now() + 4000)); } catch (_) {} // sinaliza ao supressor (mundo MAIN) que o clique é do Claude
           const before = { url: location.href, n: document.body ? document.body.childElementCount : 0 };
           cursorLabel(p.label || "Clicando"); const c = await moveTo(el); ripple(c.x, c.y); await sleep(110); el.click(); cursorLabel("");
           if (p.nowait) return { ok: true, clicked: true, nowait: true }; // fire-and-forget: não espera a página assentar
@@ -828,19 +881,43 @@
           // (o overlay de opções costuma fechar entre tool calls; aqui é tudo num comando só).
           const want = normTxt(p.label != null ? p.label : p.value);
           if (!want) return { ok: false, error: "dropdown customizado: passe 'label' (ou 'value') com o TEXTO da opção" };
-          cursorLabel("Selecionando"); await moveTo(el); el.click();
           const optSel = '[role=option],mat-option,cfc-select-option,cfc-option,li[role=option]';
+          // Painel de opções que ESTE combobox controla (aria-controls/owns nele ou num [role=combobox] interno).
+          const ownedPanel = () => {
+            try {
+              const ids = ((el.getAttribute("aria-controls") || "") + " " + (el.getAttribute("aria-owns") || "")).trim().split(/\s+/).filter(Boolean);
+              const inner = el.querySelector("[aria-controls],[aria-owns]");
+              if (inner) { const v = inner.getAttribute("aria-controls") || inner.getAttribute("aria-owns"); if (v) ids.push(...v.split(/\s+/)); }
+              for (const id of ids) { const n = document.getElementById(id); if (n) return n; }
+            } catch (_) {}
+            return null;
+          };
+          // Opções ESCOPADAS: 1º ao painel controlado; senão às opções que o overlay NOVO renderizou
+          // (diff contra o snapshot pré-abertura), evitando casar opção de OUTRO widget já aberto.
+          const preOpen = new Set([...document.querySelectorAll(optSel)]);
+          const scopedOpts = () => {
+            const panel = ownedPanel();
+            let list;
+            if (panel) list = [...panel.querySelectorAll(optSel)];
+            else { const all = [...document.querySelectorAll(optSel)]; const fresh = all.filter((o) => !preOpen.has(o)); list = fresh.length ? fresh : all; }
+            return list.filter(visible);
+          };
+          cursorLabel("Selecionando"); await moveTo(el); el.click();
           let opt = null; const t0 = Date.now();
           while (Date.now() - t0 < 3500) {
             await sleep(120);
-            const opts = [...document.querySelectorAll(optSel)].filter(visible);
+            const opts = scopedOpts();
             opt = opts.find((o) => normTxt(o.textContent) === want) || opts.find((o) => normTxt(o.textContent).includes(want));
             if (opt) break;
           }
           cursorLabel("");
-          if (!opt) { const vis = [...document.querySelectorAll(optSel)].filter(visible).slice(0, 12).map((o) => (o.textContent || "").replace(/\s+/g, " ").trim()); return { ok: false, error: "dropdown aberto, mas '" + (p.label != null ? p.label : p.value) + "' não apareceu." + (vis.length ? " Opções visíveis: " + vis.join(" | ") : " Nenhuma opção visível (o overlay pode não ter aberto).") }; }
+          if (!opt) { const vis = scopedOpts().slice(0, 12).map((o) => (o.textContent || "").replace(/\s+/g, " ").trim()); return { ok: false, error: "dropdown aberto, mas '" + (p.label != null ? p.label : p.value) + "' não apareceu." + (vis.length ? " Opções visíveis: " + vis.join(" | ") : " Nenhuma opção visível (o overlay pode não ter aberto).") }; }
+          const chosen = (opt.textContent || "").replace(/\s+/g, " ").trim();
           const cc = await moveTo(opt); ripple(cc.x, cc.y); await sleep(90); opt.click();
-          return { ok: true, selected: (opt.textContent || "").replace(/\s+/g, " ").trim() };
+          await sleep(160);
+          // confirma que surtiu efeito: texto do trigger reflete a escolha OU o overlay fechou (sem opções escopadas visíveis).
+          const verified = normTxt(el.textContent || el.value || "").includes(normTxt(chosen)) || scopedOpts().length === 0;
+          return { ok: true, selected: chosen, verified };
         }
         if (op === "submit") {
           const base = (p.selector || p.ref) ? resolveEl(p) : document.querySelector("form");
@@ -859,7 +936,7 @@
         }
         if (op === "snapshot") {
           document.querySelectorAll("[data-cm-ref]").forEach((e) => e.removeAttribute("data-cm-ref"));
-          window.__claudaoRefMap = {};
+          window.__claudaoRefMap = {}; window.__claudaoRefUrl = location.href; // carimba a tela da captura (invalida após SPA nav)
           const sel = "a[href],button,input,select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem],[role=combobox],[role=listbox],[onclick],[tabindex],[aria-haspopup],mat-select,cfc-select,cfc-switcher-button";
           const els = [...document.querySelectorAll(sel)].filter(visible).slice(0, 120);
           let i = 0; const out = els.map((e) => { const ref = "r" + (++i); e.setAttribute("data-cm-ref", ref); const r = e.getBoundingClientRect(); const label = (e.getAttribute("aria-label") || e.placeholder || (e.type === "password" ? "" : e.value) || (e.textContent || "").trim() || e.name || "").trim().slice(0, 70); const role = e.getAttribute("role") || ({ A: "link", BUTTON: "button", INPUT: (e.type || "text"), SELECT: "select", TEXTAREA: "textbox" }[e.tagName] || e.tagName.toLowerCase()); window.__claudaoRefMap[ref] = { label, role, tag: e.tagName.toLowerCase() }; return { ref, role, label, x: Math.round(r.x), y: Math.round(r.y) }; });
@@ -917,7 +994,7 @@
           const old = document.getElementById(CMK); if (old) old.remove();
           // limpa refs obsoletos de marcações anteriores (evita ref antigo colar em elemento errado)
           document.querySelectorAll("[data-cm-ref]").forEach((e) => e.removeAttribute("data-cm-ref"));
-          window.__claudaoRefMap = {}; // mapa ref→{label,role,tag} para re-resolver se o SPA re-renderizar
+          window.__claudaoRefMap = {}; window.__claudaoRefUrl = location.href; // mapa ref→{label,role,tag} + tela da captura (invalida após SPA nav)
           if (op === "unmark") return { ok: true, unmarked: true };
           const box = document.createElement("div"); box.id = CMK;
           box.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483646;";
@@ -1029,8 +1106,11 @@
         else if (text) { const tt = String(text).toLowerCase(); el = [...document.querySelectorAll("a,button,[role=button],input[type=submit],input[type=button]")].find((e) => ((e.textContent || e.value || "") + "").toLowerCase().includes(tt)); }
         if (!el) return null;
         if (el.tagName === "INPUT" && el.type === "file") return { fileInput: true };
+        // Recusa também <label> que aciona um file input (clicar nele abriria o seletor nativo).
+        try { const ctl = el.tagName === "LABEL" ? (el.control || (el.htmlFor && document.getElementById(el.htmlFor)) || el.querySelector("input[type=file]")) : null; if (ctl && ctl.tagName === "INPUT" && ctl.type === "file") return { fileInput: true }; } catch (_) {}
         el.scrollIntoView({ block: "center" });
         window.__claudaoSelfClick = Date.now() + 1500; // clique REAL do Claude → o takeover ignora
+        try { document.documentElement.setAttribute("data-cm-driving", String(Date.now() + 4000)); } catch (_) {} // sinaliza ao supressor (mundo MAIN) que o clique é do Claude
         const r = el.getBoundingClientRect();
         return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
       },
@@ -1133,9 +1213,10 @@
 
       // --- Multi-aba ---
       case "open_tab": { const tab = await chrome.tabs.create({ url: a.url, active: a.active !== false }); return { ok: true, result: { tabId: tab.id, url: a.url } }; }
-      case "close_tab": { if (!a.tabId) throw new Error("faltou 'tabId'"); await chrome.tabs.remove(a.tabId); return { ok: true, result: { closed: a.tabId } }; }
+      case "close_tab": { if (!a.tabId) throw new Error("faltou 'tabId'"); if (pausedTabs.has(a.tabId)) return { ok: false, paused: true, tab: a.tabId, error: "Aba " + a.tabId + " está PAUSADA pelo usuário — não feche esta aba. Espere ele clicar em Retomar." }; await chrome.tabs.remove(a.tabId); return { ok: true, result: { closed: a.tabId } }; }
       case "activate_tab": {
         if (!a.tabId) throw new Error("faltou 'tabId'");
+        if (pausedTabs.has(a.tabId)) return { ok: false, paused: true, tab: a.tabId, error: "Aba " + a.tabId + " está PAUSADA pelo usuário — não roube o foco desta aba. Espere ele clicar em Retomar." };
         const tb = await chrome.tabs.update(a.tabId, { active: true });
         try { if (tb && tb.windowId != null) await chrome.windows.update(tb.windowId, { focused: true }); } catch (_) {}
         return { ok: true, result: { activated: a.tabId } };

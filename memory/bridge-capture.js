@@ -74,10 +74,15 @@
   try {
     const IP = window.HTMLInputElement && window.HTMLInputElement.prototype;
     const agentActive = () => !!document.getElementById("__claudao_glow__");
-    // Só bloqueia quando NÃO há gesto real do usuário (i.e., é o Claude sintético dirigindo).
-    // Assim o upload manual do usuário (que carrega user-activation) nunca é engolido.
+    // Fonte de verdade de "é o Claude dirigindo AGORA": o SW carimba data-cm-driving no <html>
+    // logo antes de cada clique (DOM ou CDP). O clique CDP é isTrusted e carrega user-activation,
+    // então NÃO dá pra distinguir do usuário só pelo gesto — este marcador resolve.
+    const claudeDriving = () => { try { const v = +document.documentElement.getAttribute("data-cm-driving"); return v && Date.now() < v; } catch (_) { return false; } };
+    // Fallback: bloqueia também quando não há gesto algum (clique programático sem marcador).
     const noUserGesture = () => { try { return navigator.userActivation ? !navigator.userActivation.isActive : true; } catch (_) { return true; } };
-    const suppress = () => agentActive() && noUserGesture();
+    // Bloqueia se o agente está ativo E (o Claude está dirigindo OU não houve gesto real).
+    // O upload MANUAL do usuário nunca seta data-cm-driving e carrega gesto → nunca é engolido.
+    const suppress = () => agentActive() && (claudeDriving() || noUserGesture());
     const markBlocked = (el) => { try { document.documentElement.setAttribute("data-cm-fileblocked", JSON.stringify({ ts: Date.now(), name: (el && (el.name || el.id || el.getAttribute("aria-label"))) || "" })); } catch (_) {} };
     if (IP && !IP.__cmClickWrapped) {
       const oc = IP.click;
