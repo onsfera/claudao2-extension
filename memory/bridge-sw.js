@@ -204,6 +204,22 @@
     if (enabled) connect();
   })();
 
+  // Se a pausa ficou PRESA no storage (ex.: extensão recarregada com "Parar" ativo),
+  // reafirma o estado e RE-MOSTRA o botão "Retomar" nas abas http(s) abertas, para o
+  // usuário nunca ficar sem como retomar (o onChanged não dispara para estado já existente).
+  (async () => {
+    try {
+      const pv = (await chrome.storage.local.get(PAUSE_KEY))[PAUSE_KEY];
+      if (pv && pv.on) {
+        pauseActive = true;
+        // aba ativa de cada janela (onde o usuário está olhando) + fallback pra 1ª http(s)
+        let tabs = await chrome.tabs.query({ active: true, url: ["http://*/*", "https://*/*"] });
+        if (!tabs.length) tabs = (await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] })).slice(0, 1);
+        for (const t of tabs) { showResume(t.id, true); pausedTabs.add(t.id); }
+      }
+    } catch (_) {}
+  })();
+
   // -------------------------------------------------------------------------
   // Redação de segredos: valores usados em login/fill_secret são mascarados
   // em qualquer retorno textual posterior (read/console/network/query/eval...).
