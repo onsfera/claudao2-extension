@@ -20,7 +20,14 @@
       if (buf.length > 500) buf.shift();
     } catch (_) {}
   };
-  ["log", "warn", "error", "info", "debug"].forEach((level) => {
+  // Captura só log/info/debug embrulhando o console. NÃO embrulhamos warn/error DE PROPÓSITO:
+  // este script roda no mundo MAIN, então re-emitir um console.warn/error DA PÁGINA a partir do
+  // nosso frame faz o Chrome atribuir o aviso À EXTENSÃO — ele aparece em chrome://extensions >
+  // Erros, poluindo com avisos que são da página (ex.: "VIDEOJS: WARN" do LinkedIn), não bugs
+  // nossos. Os erros que IMPORTAM (exceções não capturadas e rejeições) continuam registrados pelos
+  // listeners abaixo, que não passam pelo console e não poluem. (log/info/debug não são coletados
+  // pelo Chrome como erro, então embrulhá-los é seguro.)
+  ["log", "info", "debug"].forEach((level) => {
     const orig = console[level];
     console[level] = function () {
       push(level, Array.prototype.slice.call(arguments));
