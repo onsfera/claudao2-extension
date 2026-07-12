@@ -160,13 +160,14 @@
     // ao retomar (on:false), tira a pílula (o glow volta quando o Claude agir de novo).
     if (changes[PAUSE_KEY]) {
       const pv = changes[PAUSE_KEY].newValue;
-      if (pv && pv.on) {
+      pauseActive = !!(pv && pv.on);
+      if (pauseActive) {
         clearTimeout(clearTimer);
         for (const t of glowedTabs) { glow(t, false); showResume(t, true); pausedTabs.add(t); }
         glowedTabs.clear();
         try { chrome.storage.local.set({ [ACTIVE_KEY]: { active: false, ts: Date.now() } }); } catch (_) {}
       } else {
-        for (const t of pausedTabs) showResume(t, false);
+        for (const t of pausedTabs) { glow(t, false); showResume(t, false); } // limpa glow re-injetado num race + a pílula
         pausedTabs.clear();
       }
     }
@@ -391,15 +392,14 @@
   // -------------------------------------------------------------------------
   const glowedTabs = new Set(); // TODAS as abas com glow (não uma só) — apaga todas ao encerrar
   const pausedTabs = new Set(); // abas que receberam a pílula "Retomar" ao pausar
+  let pauseActive = false;      // espelho em memória do PAUSE_KEY (evita re-glow em aba pausada num race)
   let clearTimer = null;
   const GLOW_TTL_MS = 15000;    // overlay se auto-remove se não renovado (sobrevive à morte do SW)
 
-  async function isPaused() {
-    try { const v = (await chrome.storage.local.get(PAUSE_KEY))[PAUSE_KEY]; return !!(v && v.on); } catch (_) { return false; }
-  }
   function unglowAll() { for (const t of glowedTabs) glow(t, false); glowedTabs.clear(); }
 
   async function markActive(client, tabId) {
+    if (pauseActive) return; // pausado (mesmo num race pós-gate): não re-acende glow
     if (tabId) glowedTabs.add(tabId);
     try {
       await chrome.storage.local.set({ [ACTIVE_KEY]: { active: true, client: client || "Claude externo", tab: tabId || null, ts: Date.now() } });
@@ -466,6 +466,7 @@
               if (ev.target && ev.target.id === "__claudao_stop__") return; // o botão já pausa
               if (!document.getElementById("__claudao_glow__")) return;      // só com glow ativo
               if (Date.now() > (window.__claudaoActUntil || 0)) return;      // só se o Claude agiu nos últimos ~2s
+              if (Date.now() < (window.__claudaoSelfClick || 0)) return;     // ignora o CLIQUE REAL do próprio Claude (CDP também é isTrusted)
               try { chrome.storage.local.set({ [pauseKey]: { on: true, ts: Date.now(), reason: "takeover" } }); } catch (_) {}
             };
             addEventListener("mousedown", onUser, true);
@@ -486,12 +487,16 @@
         func: (show, pauseKey) => {
           const ID = "__claudao_resume__";
           const old = document.getElementById(ID); if (old) old.remove();
+          if (window.__claudaoResumeInt) { clearInterval(window.__claudaoResumeInt); window.__claudaoResumeInt = null; }
           if (!show) return;
           const btn = document.createElement("button"); btn.id = ID;
           btn.textContent = "▶ Retomar Claude";
           btn.style.cssText = "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#1f7a3a;color:#fff;border:none;border-radius:9px;padding:8px 16px;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 3px 14px rgba(0,0,0,.45);pointer-events:auto;";
-          btn.onclick = (e) => { e.stopPropagation(); try { chrome.storage.local.set({ [pauseKey]: { on: false, ts: Date.now() } }); } catch (_) {} btn.remove(); };
+          const kill = () => { const b = document.getElementById(ID); if (b) b.remove(); if (window.__claudaoResumeInt) { clearInterval(window.__claudaoResumeInt); window.__claudaoResumeInt = null; } };
+          btn.onclick = (e) => { e.stopPropagation(); try { chrome.storage.local.set({ [pauseKey]: { on: false, ts: Date.now() } }); } catch (_) {} kill(); };
           (document.body || document.documentElement).appendChild(btn);
+          // se a pausa for desligada por qualquer via (painel, outra aba, worker morto), some sozinha
+          window.__claudaoResumeInt = setInterval(() => { try { chrome.storage.local.get(pauseKey, (o) => { const v = o && o[pauseKey]; if (!v || !v.on) kill(); }); } catch (_) {} }, 1000);
         },
         args: [!!on, PAUSE_KEY],
       });
@@ -908,18 +913,25 @@
     return r ? r.result : { ok: false, error: "sem resposta da página" };
   }
 
+  // Acha um <input type=file> percorrendo a árvore CDP piercing (inclui SHADOW DOM e iframes).
+  function findFileInputNode(node) {
+    if (!node) return 0;
+    if (node.nodeName === "INPUT") { const a = node.attributes || []; for (let i = 0; i < a.length; i += 2) { if (a[i] === "type" && String(a[i + 1]).toLowerCase() === "file") return node.nodeId; } }
+    const kids = (node.children || []).concat(node.shadowRoots || [], node.contentDocument ? [node.contentDocument] : []);
+    for (const k of kids) { const r = findFileInputNode(k); if (r) return r; }
+    return 0;
+  }
   // Upload de arquivo(s) num <input type=file> via CDP (caminhos locais).
   async function uploadFiles(tabId, selector, files) {
     return withDebugger(tabId, async (target) => {
       const { root } = await chrome.debugger.sendCommand(target, "DOM.getDocument", { depth: -1, pierce: true });
-      let nodeId = 0;
-      const q = async (sel) => { try { return (await chrome.debugger.sendCommand(target, "DOM.querySelector", { nodeId: root.nodeId, selector: sel })).nodeId || 0; } catch (_) { return 0; } };
-      if (selector) nodeId = await q(selector);
-      if (!nodeId) nodeId = await q('input[type=file]');       // fallback: primeiro input de arquivo (id dinâmico etc.)
-      if (!nodeId) { try { const all = await chrome.debugger.sendCommand(target, "DOM.querySelectorAll", { nodeId: root.nodeId, selector: 'input[type=file]' }); if (all && all.nodeIds && all.nodeIds.length) nodeId = all.nodeIds[0]; } catch (_) {} }
-      if (!nodeId) return { ok: false, error: "nenhum <input type=file> encontrado" + (selector ? " (nem por '" + selector + "' nem o primeiro da página)" : "") + ". Dica: em alguns sites o input fica oculto atrás do botão de 'carregar'." };
-      await chrome.debugger.sendCommand(target, "DOM.setFileInputFiles", { files, nodeId });
-      return { ok: true, uploaded: files.length };
+      const setFiles = async (nodeId) => { await chrome.debugger.sendCommand(target, "DOM.setFileInputFiles", { files, nodeId }); return { ok: true, uploaded: files.length }; };
+      // 1. tenta o selector do usuário; se resolver e for aceito como file input, usa.
+      if (selector) { try { const nid = (await chrome.debugger.sendCommand(target, "DOM.querySelector", { nodeId: root.nodeId, selector })).nodeId || 0; if (nid) { try { return await setFiles(nid); } catch (_) { /* não era file input → cai no fallback */ } } } catch (_) {} }
+      // 2. fallback: primeiro <input type=file> em QUALQUER lugar (light + shadow DOM + iframes).
+      const walked = findFileInputNode(root);
+      if (walked) { try { return await setFiles(walked); } catch (e) { return { ok: false, error: "input de arquivo encontrado, mas o navegador recusou: " + String((e && e.message) || e) }; } }
+      return { ok: false, error: "nenhum <input type=file> encontrado (nem em shadow DOM/iframes). Em alguns sites o input fica oculto atrás do botão de 'carregar' — confirme que ele existe na página." };
     });
   }
 
@@ -936,6 +948,7 @@
         if (!el) return null;
         if (el.tagName === "INPUT" && el.type === "file") return { fileInput: true };
         el.scrollIntoView({ block: "center" });
+        window.__claudaoSelfClick = Date.now() + 1500; // clique REAL do Claude → o takeover ignora
         const r = el.getBoundingClientRect();
         return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
       },
@@ -945,6 +958,8 @@
     if (b.result.fileInput) return { ok: false, error: "Este é um <input type=file>: use browser_upload com o caminho do arquivo, não clique." };
     const x = Math.round(b.result.x), y = Math.round(b.result.y);
     return withDebugger(tabId, async (target) => {
+      // Intercepta o seletor de arquivos (caso o clique real dispare um): evita o diálogo do SO travar.
+      try { await chrome.debugger.sendCommand(target, "Page.setInterceptFileChooserDialog", { enabled: true }); } catch (_) {}
       const base = { x, y, button: "left", clickCount: 1 };
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", ...base });

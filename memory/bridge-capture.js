@@ -74,12 +74,16 @@
   try {
     const IP = window.HTMLInputElement && window.HTMLInputElement.prototype;
     const agentActive = () => !!document.getElementById("__claudao_glow__");
+    // Só bloqueia quando NÃO há gesto real do usuário (i.e., é o Claude sintético dirigindo).
+    // Assim o upload manual do usuário (que carrega user-activation) nunca é engolido.
+    const noUserGesture = () => { try { return navigator.userActivation ? !navigator.userActivation.isActive : true; } catch (_) { return true; } };
+    const suppress = () => agentActive() && noUserGesture();
     const markBlocked = (el) => { try { document.documentElement.setAttribute("data-cm-fileblocked", JSON.stringify({ ts: Date.now(), name: (el && (el.name || el.id || el.getAttribute("aria-label"))) || "" })); } catch (_) {} };
     if (IP && !IP.__cmClickWrapped) {
       const oc = IP.click;
-      IP.click = function () { if (this.type === "file" && agentActive()) { markBlocked(this); return; } return oc.apply(this, arguments); };
+      IP.click = function () { if (this.type === "file" && suppress()) { markBlocked(this); return; } return oc.apply(this, arguments); };
       IP.__cmClickWrapped = true;
-      if (IP.showPicker) { const op = IP.showPicker; IP.showPicker = function () { if (this.type === "file" && agentActive()) { markBlocked(this); return; } return op.apply(this, arguments); }; }
+      if (IP.showPicker) { const op = IP.showPicker; IP.showPicker = function () { if (this.type === "file" && suppress()) { markBlocked(this); return; } return op.apply(this, arguments); }; }
     }
   } catch (_) {}
 })();
