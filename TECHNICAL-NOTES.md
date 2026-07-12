@@ -1,4 +1,4 @@
-# Technical Notes / Notas Técnicas — Claudão²
+# Claudão²: Technical Notes / Notas Técnicas
 
 > An independent, unofficial fork of Anthropic's **Claude in Chrome** extension, with two extra layers: persistent autonomous memory and an MCP bridge that gives editor-side Claude (VS Code, Cursor, Windsurf) real eyes and hands on the browser.
 >
