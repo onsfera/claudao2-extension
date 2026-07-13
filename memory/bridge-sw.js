@@ -235,6 +235,13 @@
     if (enabled) connect();
   })();
 
+  // Instalou/recarregou a extensão = pode ter TROCADO de pasta/bridge. O caminho exibido
+  // (cm_bridge_paths) é herança do ÚLTIMO bridge que conectou — se era o de outra pasta, ficava
+  // "grudado" indicando o bridge errado até um server_hello novo. Aqui a extensão ESQUECE o bridge
+  // anterior: mostra o placeholder até o bridge DESTA instalação conectar e se anunciar (segundos).
+  // onInstalled NÃO dispara nos restarts de idle do SW (MV3), então no dia a dia o caminho persiste.
+  try { chrome.runtime.onInstalled.addListener(() => { try { chrome.storage.local.remove("cm_bridge_paths"); } catch (_) {} }); } catch (_) {}
+
   // Se a pausa ficou PRESA no storage (ex.: extensão recarregada com "Parar" ativo),
   // reafirma o estado e RE-MOSTRA o botão "Retomar" nas abas http(s) abertas, para o
   // usuário nunca ficar sem como retomar (o onChanged não dispara para estado já existente).

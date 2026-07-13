@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Claudão²</title>
+<style>
+  :root {
+    --bg:#faf9f5; --card:#f2efe8; --text:#1f1e1d; --dim:#6b675f; --border:#e2ded4; --accent:#c96442; --err:#c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1f1e1d; --card:#2a2826; --text:#ece9e2; --dim:#9a958c; --border:#3a3836; --accent:#c96442; --err:#c0392b; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; width:290px; background:var(--bg); color:var(--text); font:13px/1.5 system-ui,-apple-system,sans-serif; padding:14px; }
+  .head { display:flex; align-items:center; gap:8px; font-weight:600; font-size:14px; margin-bottom:12px; }
+  .head .logo { color:var(--accent); font-size:16px; }
+  button { width:100%; border:1px solid var(--border); background:var(--card); color:var(--text); border-radius:9px; padding:11px 12px; font:600 13px system-ui,sans-serif; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; transition:filter .1s; }
+  button:hover { filter:brightness(1.05); }
+  .status { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--text); margin:2px 0 8px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:#8a8a8a; flex:none; }
+  .dot.on { background:#2e9e5b; } .dot.off { background:var(--err); } .dot.wait { background:#d0902f; }
+  .hint { color:var(--dim); font-size:11px; line-height:1.45; margin:2px 0 10px; }
+  .cmd { background:var(--card); border:1px solid var(--border); border-radius:7px; padding:8px 10px; font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; overflow-x:auto; white-space:nowrap; color:var(--text); margin-bottom:8px; }
+  #copy { margin-bottom:12px; font-size:12px; }
+  #open { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .foot { text-align:center; margin-top:12px; }
+  .foot a { color:var(--dim); font-size:10.5px; text-decoration:none; }
+  .foot a:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+  <div class="head"><span class="logo">✳</span> Claudão²</div>
+  <div class="status"><span class="dot" id="dot"></span> <span id="status-text">…</span></div>
+  <p class="hint">Comando da integração com o Claude externo (VS Code/Cursor/Windsurf). Rode uma vez no terminal para registrar o MCP:</p>
+  <div class="cmd"><code id="cmd">…</code></div>
+  <button id="copy">⧉ Copiar comando</button>
+  <button id="open">Abrir o Claude (painel)</button>
+  <div class="foot"><a href="https://onsfera.com" target="_blank" rel="noopener">Powered by Onsfera</a></div>
+  <script src="popup.js"></script>
+</body>
+</html>
