@@ -6,9 +6,9 @@
 const STATUS_KEY = "cm_bridge_status";
 const ENABLED_KEY = "cm_bridge_enabled";
 const PATHS_KEY = "cm_bridge_paths";
-// Placeholder distribuível (o Chrome não sabe o próprio path no disco). Ao conectar, o server
-// informa o caminho REAL desta máquina (server_hello → cm_bridge_paths) e fica gravado.
-const FALLBACK_INSTALL = "<pasta-da-extensão>/bridge/install.mjs";
+// Fallback = caminho REAL desta instalação (o Chrome não sabe o próprio path no disco; noutra
+// máquina o server_hello sobrescreve com o caminho local ao conectar — cm_bridge_paths).
+const FALLBACK_INSTALL = "C:/Users/ferna/Desktop/Extensão Claude/extensao-mod/bridge/install.mjs";
 let cmdText = "";
 
 async function refreshStatus() {

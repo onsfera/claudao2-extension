@@ -36,12 +36,10 @@
   const EXTRELOAD_KEY = "cm_allow_ext_reload"; // deixar o Claude externo recarregar a extensão (padrão: sim)
   const REDACTPII_KEY = "cm_redact_pii";     // borrar campos sensíveis nas screenshots (padrão: não)
   const DEFAULT_ALLOW = ["localhost", "127.0.0.1"];
-  // Placeholder distribuível (o Chrome não sabe o próprio path no disco). Ao conectar,
-  // o server informa o caminho REAL desta máquina (server_hello → cm_bridge_paths) e a
-  // tela Conectar passa a mostrar o comando exato. Com a integração ligada por padrão,
-  // isso acontece em segundos.
-  const BRIDGE_MCP_PATH = "<pasta-da-extensão>/bridge/mcp-server.mjs";
-  const BRIDGE_INSTALL_PATH = "<pasta-da-extensão>/bridge/install.mjs";
+  // Fallback = caminho REAL desta instalação (o Chrome não sabe o próprio path no disco; noutra
+  // máquina o server_hello sobrescreve com o caminho local ao conectar — cm_bridge_paths).
+  const BRIDGE_MCP_PATH = "C:/Users/ferna/Desktop/Extensão Claude/extensao-mod/bridge/mcp-server.mjs";
+  const BRIDGE_INSTALL_PATH = "C:/Users/ferna/Desktop/Extensão Claude/extensao-mod/bridge/install.mjs";
   const PATHS_KEY = "cm_bridge_paths";
   const BRAND_ORANGE = "#c96442";
   const MARKER_RE = /^[ \t>*\-]*MEM[ÓO]RIA(?:\s*-\s*(APAGAR|REMOVER|DELETE|SUBSTITUIR|TROCAR))?(?:\s*\[([^\]]+)\])?\s*:\s*(.+?)\s*$/gim;

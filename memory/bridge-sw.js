@@ -519,7 +519,7 @@
           // Restaura o sinal DA ABA (favicon + título) ao valor original.
           const cmClearTab = () => {
             if (window.__claudaoTabInt) { clearInterval(window.__claudaoTabInt); window.__claudaoTabInt = null; }
-            try { document.title = document.title.replace(/^✳ /, ""); } catch (_) {}
+            try { document.title = document.title.replace(/^[·✢*✶✻✽✳] /, ""); } catch (_) {}
             try { const h = window.__claudaoTabSaved && window.__claudaoTabSaved.fav; document.querySelectorAll('link[rel~="icon"][data-cm-fav]').forEach((l) => { if (h != null) l.href = h; l.removeAttribute("data-cm-fav"); }); } catch (_) {}
             window.__claudaoTabSaved = null;
           };
@@ -553,33 +553,36 @@
               }
             }, 3000);
           }
-          // Sinal NA ABA (barra de abas): favicon com a LOGOMARCA DO CLAUDE (sunburst laranja) GIRANDO
-          // suavemente + marcador no título, pra ver de relance QUAIS abas o Claude está mexendo.
+          // Sinal NA ABA (barra de abas): favicon com o SPINNER DO CLAUDE CODE — os MESMOS frames e
+          // ritmo do "pensando" do VS Code (frames "·✢*✶✻✽" em ping-pong, 120ms; extraídos do
+          // webview/index.js da extensão oficial) — em laranja Claude, + o mesmo frame no título.
           // Segue o mesmo TTL do glow; restaura o favicon/título originais ao pausar/terminar.
           if (!window.__claudaoTabSaved) { const f = document.querySelector('link[rel~="icon"]'); window.__claudaoTabSaved = { fav: f ? f.href : null }; }
-          if (!window.__claudaoLogo) {
-            window.__claudaoLogo = (rot) => {
+          const CM_FRAMES = ["·", "✢", "*", "✶", "✻", "✽"]; const CM_CYCLE = [...CM_FRAMES, ...[...CM_FRAMES].reverse()];
+          if (!window.__claudaoFrameFav) {
+            window.__claudaoFavCache = {}; // só 6 glifos únicos: pré-renderiza 1x e reusa (sem toDataURL a cada tick)
+            window.__claudaoFrameFav = (ch) => {
+              if (window.__claudaoFavCache[ch]) return window.__claudaoFavCache[ch];
               try {
                 const c = document.createElement("canvas"); const S = 32; c.width = c.height = S; const x = c.getContext("2d");
-                x.clearRect(0, 0, S, S); x.save(); x.translate(S / 2, S / 2); x.rotate(rot);
-                x.strokeStyle = "#D97757"; x.lineCap = "round"; x.lineWidth = S * 0.09; // raios do sunburst (laranja Claude)
-                const R = [0.43, 0.28, 0.40, 0.26, 0.42, 0.29, 0.43, 0.27, 0.41, 0.28, 0.42, 0.27]; // raios de comprimentos variados (orgânico, como a marca do Claude); máx 0.43 p/ o cap arredondado não cortar na borda
-                for (let i = 0; i < 12; i++) { const a = (i / 12) * Math.PI * 2 - Math.PI / 2; const len = S * R[i]; const inr = S * 0.05; x.beginPath(); x.moveTo(Math.cos(a) * inr, Math.sin(a) * inr); x.lineTo(Math.cos(a) * len, Math.sin(a) * len); x.stroke(); }
-                x.restore(); return c.toDataURL("image/png");
+                x.clearRect(0, 0, S, S); x.fillStyle = "#D97757"; x.textAlign = "center"; x.textBaseline = "middle";
+                x.font = "600 " + Math.round(S * 0.88) + "px system-ui, 'Segoe UI Symbol', sans-serif";
+                x.fillText(ch, S / 2, S / 2 + S * 0.04);
+                const url = c.toDataURL("image/png"); window.__claudaoFavCache[ch] = url; return url;
               } catch (_) { return null; }
             };
           }
           const cmSetFav = (href) => { if (href == null) return; let links = document.querySelectorAll('link[rel~="icon"]'); if (!links.length) { const l = document.createElement("link"); l.rel = "icon"; (document.head || document.documentElement).appendChild(l); links = document.querySelectorAll('link[rel~="icon"]'); } links.forEach((l) => { l.setAttribute("data-cm-fav", "1"); if (l.href !== href) l.href = href; }); };
           if (!window.__claudaoTabInt) {
-            window.__claudaoTabRot = 0;
+            window.__claudaoTabFrame = 0;
             const tick = () => {
               if (Date.now() - (window.__claudaoGlowTs || 0) > (ttl || 15000)) { cmClearTab(); return; }
-              window.__claudaoTabRot = (window.__claudaoTabRot + 0.3) % (Math.PI * 2);
-              const f = window.__claudaoLogo(window.__claudaoTabRot); if (f) cmSetFav(f);
-              try { document.title = "✳ " + document.title.replace(/^✳ /, ""); } catch (_) {} // marcador (re-aplica p/ sobreviver a SPA)
+              const ch = CM_CYCLE[window.__claudaoTabFrame = (window.__claudaoTabFrame + 1) % CM_CYCLE.length];
+              const f = window.__claudaoFrameFav(ch); if (f) cmSetFav(f);
+              try { document.title = ch + " " + document.title.replace(/^[·✢*✶✻✽✳] /, ""); } catch (_) {} // marcador com o MESMO frame (re-aplica p/ sobreviver a SPA)
             };
             tick(); // aplica de imediato (não espera o 1º intervalo)
-            window.__claudaoTabInt = setInterval(tick, 160);
+            window.__claudaoTabInt = setInterval(tick, 120); // mesmo ritmo do spinner do Claude Code
           }
           // auto-pausa: input REAL do usuário com glow ativo = "assumi o controle"
           if (!window.__claudaoTakeoverBound) {
