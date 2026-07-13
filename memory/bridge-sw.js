@@ -559,13 +559,15 @@
           // Segue o mesmo TTL do glow; restaura o favicon/título originais ao pausar/terminar.
           if (!window.__claudaoTabSaved) { const f = document.querySelector('link[rel~="icon"]'); window.__claudaoTabSaved = { fav: f ? f.href : null }; }
           const CM_FRAMES = ["·", "✢", "*", "✶", "✻", "✽"]; const CM_CYCLE = [...CM_FRAMES, ...[...CM_FRAMES].reverse()];
-          if (!window.__claudaoFrameFav) {
-            window.__claudaoFavCache = {}; // só 6 glifos únicos: pré-renderiza 1x e reusa (sem toDataURL a cada tick)
+          const CM_FAV_COLOR = "#ff2020"; // vermelho vivo (pedido do Fernando; era o laranja Claude #D97757)
+          if (!window.__claudaoFrameFav || window.__claudaoFavColor !== CM_FAV_COLOR) {
+            window.__claudaoFavColor = CM_FAV_COLOR;
+            window.__claudaoFavCache = {}; // só 6 glifos únicos: pré-renderiza 1x e reusa (sem toDataURL a cada tick); recacheia se a cor mudar
             window.__claudaoFrameFav = (ch) => {
               if (window.__claudaoFavCache[ch]) return window.__claudaoFavCache[ch];
               try {
                 const c = document.createElement("canvas"); const S = 32; c.width = c.height = S; const x = c.getContext("2d");
-                x.clearRect(0, 0, S, S); x.fillStyle = "#D97757"; x.textAlign = "center"; x.textBaseline = "middle";
+                x.clearRect(0, 0, S, S); x.fillStyle = CM_FAV_COLOR; x.textAlign = "center"; x.textBaseline = "middle";
                 x.font = "600 " + Math.round(S * 0.88) + "px system-ui, 'Segoe UI Symbol', sans-serif";
                 x.fillText(ch, S / 2, S / 2 + S * 0.04);
                 const url = c.toDataURL("image/png"); window.__claudaoFavCache[ch] = url; return url;
