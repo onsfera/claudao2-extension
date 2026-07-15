@@ -34,12 +34,24 @@ document.getElementById("copy").addEventListener("click", async () => {
   setTimeout(() => { btn.textContent = "⧉ Copiar comando"; }, 1500);
 });
 
-document.getElementById("open").addEventListener("click", async () => {
+// Aba ativa PRÉ-carregada no load do popup: o sidePanel.open precisa rodar com o gesto do usuário
+// vivo — um await dentro do click (tabs.query/windows.getCurrent) pode invalidar o gesto.
+let cmActiveTab = null;
+try { chrome.tabs.query({ active: true, currentWindow: true }, (ts) => { cmActiveTab = (ts && ts[0]) || null; }); } catch (_) {}
+
+document.getElementById("open").addEventListener("click", () => {
+  // Réplica do fluxo do bundle original (action.onClicked de antes do popup): o painel é POR ABA,
+  // com o tabId na URL — open({windowId}) sozinho falha porque nenhum path foi setado (não há
+  // side_panel.default_path no manifest; o bundle seta por aba).
   try {
-    const w = await chrome.windows.getCurrent();
-    if (chrome.sidePanel && chrome.sidePanel.open) await chrome.sidePanel.open({ windowId: w.id });
+    if (cmActiveTab && cmActiveTab.id != null) {
+      chrome.sidePanel.setOptions({ tabId: cmActiveTab.id, path: "sidepanel.html?tabId=" + encodeURIComponent(cmActiveTab.id), enabled: true });
+      const p = chrome.sidePanel.open({ tabId: cmActiveTab.id }); if (p && p.catch) p.catch(() => {});
+    } else if (cmActiveTab && cmActiveTab.windowId != null) {
+      const p = chrome.sidePanel.open({ windowId: cmActiveTab.windowId }); if (p && p.catch) p.catch(() => {});
+    }
   } catch (_) {}
-  window.close();
+  setTimeout(() => window.close(), 150); // fecha depois do open despachar (fechar já pode abortar o gesto)
 });
 
 // Reflete mudanças ao vivo (conexão cai/sobe, server_hello atualiza o caminho).
