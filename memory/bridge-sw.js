@@ -392,6 +392,46 @@
   // relevância quando o usuário pergunta "o que fizemos em X?"). Ninguém precisa
   // lembrar de anotar — o registro nasce das próprias ações.
   // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // GRUPOS DE ABAS SOB DEMANDA — cada agente externo (client) tem UM grupo Chrome,
+  // criado só quando o contexto vira multi-aba. Persistido (client → {groupId, windowId}),
+  // reidratado e validado (o grupo pode ter sido fechado). Ver PRD-grupos-de-abas-sob-demanda.md.
+  // -------------------------------------------------------------------------
+  const AGENT_GROUPS_KEY = "cm_agent_groups";
+  const GROUP_COLORS = ["blue", "cyan", "green", "orange", "red", "pink", "purple", "grey"];
+  function groupColorFor(client) { let h = 0; const s = String(client || ""); for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return GROUP_COLORS[h % GROUP_COLORS.length]; }
+  function groupTitleFor(client) { const parts = String(client || "agente").split(" · "); return ("Claudão² · " + (parts[parts.length - 1] || "agente")).slice(0, 40); }
+  let agentGroupChain = Promise.resolve();
+  function agentGroupQ(fn) { const run = agentGroupChain.then(fn); agentGroupChain = run.then(() => {}, () => {}); return run; } // serializa (evita 2 grupos p/ o mesmo client em corrida)
+  // READ-ONLY (nunca escreve → sem lost-update no blob compartilhado): a limpeza de entrada stale
+  // acontece só DENTRO de ensureAgentGroup, que roda serializado na fila agentGroupQ.
+  async function getAgentGroup(client) {
+    const all = (await chrome.storage.local.get(AGENT_GROUPS_KEY))[AGENT_GROUPS_KEY] || {};
+    const rec = all[client];
+    if (!rec) return null;
+    try { await chrome.tabGroups.get(rec.groupId); return rec; } catch (_) { return null; } // grupo fechado → trata como sem grupo
+  }
+  // Agrupa tabIds no grupo do client; cria o grupo (nomeado/colorido) se não existe. TODO o
+  // read-modify-write do storage roda AQUI, dentro da fila → atômico. Retorna groupId ou null (falha).
+  function ensureAgentGroup(client, tabIds) {
+    return agentGroupQ(async () => {
+      const ids = (Array.isArray(tabIds) ? tabIds : [tabIds]).filter((x) => x != null);
+      if (!ids.length) return null;
+      const all = (await chrome.storage.local.get(AGENT_GROUPS_KEY))[AGENT_GROUPS_KEY] || {};
+      let rec = all[client];
+      if (rec) { try { await chrome.tabGroups.get(rec.groupId); } catch (_) { rec = null; } } // stale?
+      if (rec) {
+        try { await chrome.tabs.group({ tabIds: ids, groupId: rec.groupId }); return rec.groupId; }
+        catch (_) { rec = null; } // grupo sumiu entre validar e agrupar: cai pra recriar
+      }
+      let groupId; try { groupId = await chrome.tabs.group({ tabIds: ids }); } catch (_) { return null; }
+      let windowId = null; try { windowId = (await chrome.tabs.get(ids[0])).windowId; } catch (_) {}
+      all[client] = { groupId, windowId }; try { await chrome.storage.local.set({ [AGENT_GROUPS_KEY]: all }); } catch (_) {}
+      try { await chrome.tabGroups.update(groupId, { title: groupTitleFor(client), color: groupColorFor(client) }); } catch (_) {}
+      return groupId;
+    });
+  }
+
   const DIARY_DOC = "diario-do-agente.md";
   const DIARY_BUF_KEY = "cm_agent_diary";
   const DIARY_GAP_MS = 10 * 60 * 1000; // silêncio que fecha uma "sessão de trabalho"
@@ -1547,7 +1587,44 @@
       }
 
       // --- Multi-aba ---
-      case "open_tab": { const tab = await chrome.tabs.create({ url: a.url, active: a.active !== false }); return { ok: true, result: { tabId: tab.id, url: a.url } }; }
+      case "open_tab": {
+        const client = msg.client || "Claude externo";
+        const tab = await chrome.tabs.create({ url: a.url, active: a.active !== false });
+        let grouped = false;
+        // Auto-agrupa se pedido (group:true) OU se o agente JÁ tem um grupo (mantém tudo junto).
+        if (a.group === true || (a.group !== false && await getAgentGroup(client))) {
+          const gid = await ensureAgentGroup(client, [tab.id]); grouped = gid != null; // reflete o resultado REAL
+        }
+        return { ok: true, result: { tabId: tab.id, url: a.url, grouped } };
+      }
+      case "tab_group": {
+        const client = msg.client || "Claude externo";
+        const act = a.action || "create";
+        if (act === "list") {
+          const rec = await getAgentGroup(client);
+          if (!rec) return { ok: true, result: { group: null } };
+          let title = "", color = ""; try { const g = await chrome.tabGroups.get(rec.groupId); title = g.title; color = g.color; } catch (_) {}
+          const members = (await chrome.tabs.query({ groupId: rec.groupId })).map((t) => ({ tabId: t.id, url: t.url, title: t.title }));
+          return { ok: true, result: { groupId: rec.groupId, title, color, members } };
+        }
+        // Guard de pausa: NÃO agrupa/move/desagrupa uma aba que o usuário pausou (grupo pode mover a aba de janela).
+        const paused = (a.tabIds || []).find((tid) => pausedTabs.has(tid));
+        if (paused != null) return { ok: false, paused: true, tab: paused, error: "Aba " + paused + " está PAUSADA pelo usuário — não agrupe/mova esta aba. Espere ele clicar em Retomar." };
+        if (act === "ungroup") {
+          const ids = (a.tabIds || []).filter((x) => x != null);
+          if (!ids.length) throw new Error("faltou 'tabIds' p/ ungroup");
+          try { await chrome.tabs.ungroup(ids); } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+          return { ok: true, result: { ungrouped: ids } };
+        }
+        if (act !== "create" && act !== "add") throw new Error("action inválida: '" + act + "' (use create | add | list | ungroup)");
+        let ids = (a.tabIds || []).filter((x) => x != null);
+        if (!ids.length) { const at = await resolveTab({}); if (at) { if (pausedTabs.has(at)) return { ok: false, paused: true, tab: at, error: "A aba ativa está PAUSADA pelo usuário — não a agrupe. Espere Retomar." }; ids = [at]; } }
+        if (!ids.length) throw new Error("nenhuma aba p/ agrupar (passe tabIds ou tenha uma aba ativa)");
+        const groupId = await ensureAgentGroup(client, ids);
+        if (groupId == null) return { ok: false, error: "não consegui agrupar (grupo/abas indisponíveis — talvez em janelas diferentes)" };
+        if (a.title || a.color) { try { await chrome.tabGroups.update(groupId, Object.assign({}, a.title ? { title: String(a.title).slice(0, 40) } : {}, a.color ? { color: a.color } : {})); } catch (_) {} }
+        return { ok: true, result: { groupId, added: ids, title: groupTitleFor(client) } };
+      }
       case "close_tab": { if (!a.tabId) throw new Error("faltou 'tabId'"); if (pausedTabs.has(a.tabId)) return { ok: false, paused: true, tab: a.tabId, error: "Aba " + a.tabId + " está PAUSADA pelo usuário — não feche esta aba. Espere ele clicar em Retomar." }; await chrome.tabs.remove(a.tabId); return { ok: true, result: { closed: a.tabId } }; }
       case "activate_tab": {
         if (!a.tabId) throw new Error("faltou 'tabId'");
