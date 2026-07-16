@@ -100,14 +100,14 @@
         return;
       }
       if (!msg || !msg.cmd) return;
-      let reply, tabId = null, host = "";
+      let reply, tabId = null, host = "", tabTitle = "";
       try {
         const TAB_CMDS = { read: 1, console: 1, eval: 1, screenshot: 1, click: 1, fill: 1, navigate: 1, query: 1, snapshot: 1, get_state: 1, network: 1, wait: 1, type: 1, press: 1, hover: 1, scroll: 1, select: 1, submit: 1, history: 1, login: 1, fill_secret: 1, upload: 1, move_cursor: 1, drag: 1, look: 1, mark: 1, inspect: 1, observe: 1 };
         const needsTab = !!TAB_CMDS[msg.cmd];
         tabId = needsTab ? await resolveTab(msg.args || {}) : null;
         await hydrationReady;   // após restart do SW, espera o pausedTabs repovoar antes de checar a pausa
         let tabUrl = "";
-        if (tabId) { try { const tb = await chrome.tabs.get(tabId); tabUrl = tb.url || tb.pendingUrl || ""; host = hostOf(tabUrl); } catch (_) {} }
+        if (tabId) { try { const tb = await chrome.tabs.get(tabId); tabUrl = tb.url || tb.pendingUrl || ""; host = hostOf(tabUrl); tabTitle = tb.title || ""; } catch (_) {} }
         // "Parar Claude" GRANULAR: só recusa se ESTA aba está pausada. Outras abas seguem livres.
         if (tabId && pausedTabs.has(tabId)) {
           const info = pausedTabs.get(tabId) || {};
@@ -153,6 +153,10 @@
         reply = { ok: false, error: String((e && e.message) || e) };
       }
       logAction({ t: Date.now(), cmd: msg.cmd, client: msg.client || "", tabId: tabId || null, host, ok: !!(reply && reply.ok), error: reply && reply.error ? String(reply.error).slice(0, 140) : "", needsConsent: !!(reply && reply.needsConsent), summary: summarizeArgs(msg.cmd, msg.args) });
+      // Memória procedural: alimenta o diário da sessão. Em navigate/open_tab o que interessa é o
+      // DESTINO (o host/título capturados na linha 110 são os PRÉ-navegação).
+      const dHost = ((msg.cmd === "navigate" || msg.cmd === "open_tab") && msg.args && msg.args.url) ? hostOf(msg.args.url) : host;
+      diaryTrack(msg.client, msg.cmd, dHost, dHost === host ? tabTitle : "", !!(reply && reply.ok));
       try { ws.send(JSON.stringify({ id: msg.id, ...reply })); } catch (_) {}
     };
     ws.onclose = () => { setStatus(false); if (enabled) schedule(); };
@@ -218,6 +222,9 @@
     chrome.alarms.create("cm_bridge_keepalive", { periodInMinutes: 0.5 });
     chrome.alarms.onAlarm.addListener((a) => {
       if (a.name === "cm_bridge_keepalive" && enabled && (!ws || ws.readyState > 1)) connect();
+      // O alarm sobrevive à morte do SW e o re-acorda: fecha sessões órfãs do diário
+      // (agente parou e o SW morreu antes do gap — sem isso o resumo nunca seria gravado).
+      if (a.name === "cm_bridge_keepalive") diaryFlushStale();
     });
   } catch (_) {}
   try { chrome.runtime.onStartup.addListener(() => { if (enabled) connect(); }); } catch (_) {}
@@ -375,6 +382,107 @@
       } catch (_) {}
     }, () => {});
     return logChain;
+  }
+
+  // -------------------------------------------------------------------------
+  // DIÁRIO DO AGENTE — memória PROCEDURAL automática. Cada comando do Claude
+  // externo alimenta um buffer por cliente (persistido no storage: sobrevive à
+  // morte do SW); após DIARY_GAP_MS sem atividade, a sessão vira UMA linha-resumo
+  // no doc "diario-do-agente.md" (pool de retrieval: o painel recupera por
+  // relevância quando o usuário pergunta "o que fizemos em X?"). Ninguém precisa
+  // lembrar de anotar — o registro nasce das próprias ações.
+  // -------------------------------------------------------------------------
+  const DIARY_DOC = "diario-do-agente.md";
+  const DIARY_BUF_KEY = "cm_agent_diary";
+  const DIARY_GAP_MS = 10 * 60 * 1000; // silêncio que fecha uma "sessão de trabalho"
+  const DIARY_MAX_ENTRIES = 200;       // poda FIFO das linhas mais antigas
+  // Header MÍNIMO de propósito: um parágrafo descritivo aqui viraria chunk e competiria no
+  // retrieval (na simulação ele VENCEU conteúdo real). O título basta.
+  const DIARY_HEADER = "# Diário do agente\n\n";
+  let diaryChain = Promise.resolve();
+  function diaryQ(fn) { diaryChain = diaryChain.then(fn).catch(() => {}); return diaryChain; }
+  // Fila ÚNICA de escrita da memória no SW: cm_memory_v1 é um blob com read-modify-write — o flush
+  // do diário e as tools memory_* concorrentes se clobberavam (last-write-wins, provado em repro:
+  // um doc inteiro sumia). TODA escrita de memória do SW passa por aqui. (A escrita do painel/content
+  // script continua em outro contexto — risco pré-existente, não coberto por esta fila.)
+  let memChain = Promise.resolve();
+  function memQ(fn) { const run = memChain.then(fn); memChain = run.then(() => {}, () => {}); return run; }
+  function diaryCat(cmd) {
+    if (cmd === "navigate" || cmd === "history" || cmd === "open_tab" || cmd === "close_tab" || cmd === "activate_tab") return "nav";
+    if (/^(click|fill|fill_secret|type|press|select|submit|drag|upload|login|hover|scroll|move_cursor)$/.test(cmd)) return "act";
+    return "read";
+  }
+  function diaryTrack(client, cmd, host, title, ok) {
+    if (!host || !MEM || String(cmd || "").startsWith("memory")) return;
+    const c = client || "Claude externo";
+    diaryQ(async () => {
+      const now = Date.now();
+      const buf = (await chrome.storage.local.get(DIARY_BUF_KEY))[DIARY_BUF_KEY] || {};
+      let s = buf[c];
+      // Gap longo = sessão anterior fecha antes desta abrir. Só descarta se o flush GRAVOU;
+      // se falhou, segue acumulando na sessão antiga (nada se perde, retry implícito).
+      if (s && now - (s.last || 0) > DIARY_GAP_MS) { if (await diaryFlushSession(c, s)) s = null; }
+      if (!s) s = { start: now, last: 0, hosts: {}, cats: { nav: 0, act: 0, read: 0 }, err: 0, total: 0 };
+      s.last = now; s.total++;
+      const h = s.hosts[host] || (s.hosts[host] = { t: "", n: 0 });
+      h.n++;
+      const tt = String(title || "").replace(/^[·✢*✶✻✽✳] /, "").replace(/\s+/g, " ").trim(); // tira o frame do indicador de aba do próprio Claudão
+      if (tt) h.t = tt.slice(0, 70);
+      s.cats[diaryCat(cmd)]++;
+      if (!ok) s.err++;
+      buf[c] = s;
+      await chrome.storage.local.set({ [DIARY_BUF_KEY]: buf });
+    });
+  }
+  function diaryFmt(client, s) {
+    const hm = (t) => { const d = new Date(t); return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); };
+    const names = Object.keys(s.hosts);
+    const hosts = Object.entries(s.hosts).sort((a, b) => b[1].n - a[1].n).slice(0, 3)
+      .map(([hh, v]) => hh + (v.t ? ' ("' + v.t + '")' : "")).join(", ");
+    const extra = names.length > 3 ? " e +" + (names.length - 3) + " sites" : "";
+    const parts = [];
+    if (s.cats.act) parts.push(s.cats.act + " interações");
+    if (s.cats.nav) parts.push(s.cats.nav + " navegações");
+    if (s.cats.read) parts.push(s.cats.read + " leituras");
+    if (s.err) parts.push(s.err + " erros");
+    return hm(s.start) + "–" + hm(s.last) + " · " + client + " agiu em " + hosts + extra + " · " + parts.join(", ");
+  }
+  async function diaryFlushSession(client, s) {
+    if (!s || !s.total) return true; // nada a gravar = "sucesso" (pode descartar)
+    if (!MEM) return false;          // memória indisponível: mantém no buffer p/ retry
+    try {
+      // Composite atômico DENTRO da fila memQ: getDoc→(criar)→reconstruir→upsert sem escrita
+      // concorrente do SW no meio (era a janela em que memory_write do usuário era engolido).
+      await memQ(async () => {
+        let doc = await MEM.getDoc(DIARY_DOC);
+        // pinned:false EXPLÍCITO na criação: o diário vive no POOL (recuperado por relevância);
+        // nascer pinned (default do upsert/append) injetaria o diário INTEIRO em toda mensagem.
+        if (!doc) { await MEM.upsertDoc(DIARY_DOC, DIARY_HEADER, false); doc = await MEM.getDoc(DIARY_DOC); }
+        const d = new Date(s.start);
+        const dt = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+        const line = "- (" + dt + ") " + diaryFmt(client, s);
+        const bullets = String((doc && doc.content) || "").split("\n").filter((l) => l.startsWith("- ("));
+        // Idempotente: re-flush da MESMA sessão (SW morreu entre gravar o doc e limpar o buffer)
+        // gera linha idêntica → não duplica.
+        if (!bullets.includes(line)) bullets.push(line);
+        // upsert direto (SEM appendToDoc): o dedup por Dice do append engoliria sessões parecidas de
+        // dias diferentes (a data do prefixo é descartada na comparação) — diário precisa ser fiel.
+        await MEM.upsertDoc(DIARY_DOC, DIARY_HEADER + bullets.slice(-DIARY_MAX_ENTRIES).join("\n") + "\n"); // pinned omitido = preserva a flag existente
+      });
+      return true;
+    } catch (_) { return false; } // falha de IO: sessão fica no buffer (retry no próximo alarm/comando)
+  }
+  function diaryFlushStale() {
+    diaryQ(async () => {
+      const buf = (await chrome.storage.local.get(DIARY_BUF_KEY))[DIARY_BUF_KEY];
+      if (!buf || typeof buf !== "object") return;
+      const now = Date.now(); let changed = false;
+      for (const [client, s] of Object.entries(buf)) {
+        // Só remove do buffer quem FOI gravado; falha fica p/ o próximo alarm (30s).
+        if (now - ((s && s.last) || 0) > DIARY_GAP_MS && (await diaryFlushSession(client, s))) { delete buf[client]; changed = true; }
+      }
+      if (changed) await chrome.storage.local.set({ [DIARY_BUF_KEY]: buf });
+    });
   }
 
   // Trava por aba: uma fila de promessas por tabId. Comandos no mesmo tabId
@@ -1518,19 +1626,19 @@
       case "memory_append": {
         if (!MEM) throw new Error("memória indisponível");
         if (!a.text) throw new Error("faltou 'text'");
-        const r = await MEM.capture(a.text, a.file || "");
+        const r = await memQ(() => MEM.capture(a.text, a.file || "")); // fila única: sem clobber com o flush do diário
         return { ok: true, result: r || { skipped: true } };
       }
       case "memory_write": {
         if (!MEM) throw new Error("memória indisponível");
         if (!a.name || a.content == null) throw new Error("faltou 'name'/'content'");
-        await MEM.upsertDoc(a.name, a.content, a.pinned);
+        await memQ(() => MEM.upsertDoc(a.name, a.content, a.pinned)); // fila única: sem clobber com o flush do diário
         return { ok: true, result: { written: a.name } };
       }
       case "memory_delete": {
         if (!MEM) throw new Error("memória indisponível");
         if (!a.name) throw new Error("faltou 'name'");
-        await MEM.deleteDoc(a.name);
+        await memQ(() => MEM.deleteDoc(a.name)); // fila única: sem clobber com o flush do diário
         return { ok: true, result: { deleted: a.name } };
       }
 

@@ -351,26 +351,36 @@
       const maxChunks = opts.maxChunks || 12;
       const maxChars = opts.maxChars || 3500;
       const pool = (opts.docs || mem.docs).filter((d) => !d.pinned && (d.content || "").trim());
+      // Cap por doc: docs de LOG (ex.: diário do agente, com dezenas de linhas quase iguais) não
+      // podem monopolizar as vagas e expulsar fatos curados de outros docs.
+      const maxPerDoc = opts.maxPerDoc || 4;
       const scored = [];
+      let idx = 0;
       for (const d of pool) {
         for (const c of chunkContent(d.content)) {
           const cTokens = tokenize(c.heading + " " + c.text);
-          if (!cTokens.length) continue;
+          if (!cTokens.length) { idx++; continue; }
           const seen = new Set();
           let overlap = 0;
           for (const t of cTokens) if (qSet.has(t) && !seen.has(t)) { overlap++; seen.add(t); }
-          if (!overlap) continue;
+          if (!overlap) { idx++; continue; }
           const score = overlap / Math.sqrt(cTokens.length) + overlap * 0.15;
-          scored.push({ doc: d.name, heading: c.heading, text: c.text, score });
+          scored.push({ doc: d.name, heading: c.heading, text: c.text, score, idx });
+          idx++;
         }
       }
-      scored.sort((a, b) => b.score - a.score);
+      // Empate de score → vence o chunk MAIS RECENTE (maior idx: em docs de append, o mais novo
+      // fica no fim — antes o sort estável mantinha os mais ANTIGOS e cortava justamente o de ontem).
+      scored.sort((a, b) => b.score - a.score || b.idx - a.idx);
       const out = [];
+      const perDoc = {};
       let chars = 0;
       for (const s of scored) {
         if (out.length >= maxChunks) break;
+        if ((perDoc[s.doc] || 0) >= maxPerDoc) continue;
         chars += s.text.length;
         if (chars > maxChars && out.length) break;
+        perDoc[s.doc] = (perDoc[s.doc] || 0) + 1;
         out.push(s);
       }
       return out;
