@@ -335,6 +335,10 @@ async function handle(msg) {
   const { id, method, params } = msg;
   if (method === "initialize") {
     if (params && params.clientInfo && params.clientInfo.name) clientName = params.clientInfo.name;
+    // PROJETO no nome: cada janela do editor sobe o próprio server com cwd = pasta do projeto.
+    // Com várias janelas de VS Code/Cursor abertas, badge/painel/diário precisam dizer QUAL
+    // projeto está agindo — "claude-code" sozinho é ambíguo.
+    try { const proj = path.basename(process.cwd()); if (proj && proj.length > 1 && !clientName.includes(proj)) clientName += " · " + proj.slice(0, 30); } catch (_) {}
     log("cliente MCP:", clientName);
     send({ jsonrpc: "2.0", id, result: { protocolVersion: (params && params.protocolVersion) || "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "claudao2-bridge", version: "1.0.0" }, instructions: SERVER_INSTRUCTIONS } });
     return;

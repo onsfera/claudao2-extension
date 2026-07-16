@@ -661,7 +661,7 @@
           }
           if (!document.getElementById("__claudao_stop__")) {
             const btn = document.createElement("button"); btn.id = "__claudao_stop__";
-            btn.innerHTML = "⏸ " + str.pause + (label ? " <span style='opacity:.7;font-weight:400'>· " + String(label).slice(0, 24) + "</span>" : "");
+            btn.innerHTML = "⏸ " + str.pause + (label ? " <span style='opacity:.7;font-weight:400'>· " + String(label).slice(0, 48) + "</span>" : ""); // 48: cabe "claude-code · <projeto>" (multi-janela)
             btn.style.cssText = "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#c0392b;color:#fff;border:none;border-radius:9px;padding:8px 16px;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 3px 14px rgba(0,0,0,.45);pointer-events:auto;";
             btn.onclick = (e) => { e.stopPropagation(); try { chrome.runtime.sendMessage({ cm_pause: true, reason: "button" }); } catch (_) {} btn.textContent = str.paused; btn.style.background = "#7a1f1f"; };
             (document.body || document.documentElement).appendChild(btn);
