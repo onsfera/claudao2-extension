@@ -156,7 +156,7 @@
       // Memória procedural: alimenta o diário da sessão. Em navigate/open_tab o que interessa é o
       // DESTINO (o host/título capturados na linha 110 são os PRÉ-navegação).
       const dHost = ((msg.cmd === "navigate" || msg.cmd === "open_tab") && msg.args && msg.args.url) ? hostOf(msg.args.url) : host;
-      diaryTrack(msg.client, msg.cmd, dHost, dHost === host ? tabTitle : "", !!(reply && reply.ok));
+      diaryTrack(msg.client, msg.cmd, dHost, dHost === host ? tabTitle : "", !!(reply && reply.ok), msg.args);
       try { ws.send(JSON.stringify({ id: msg.id, ...reply })); } catch (_) {}
     };
     ws.onclose = () => { setStatus(false); if (enabled) schedule(); };
@@ -412,9 +412,15 @@
     if (/^(click|fill|fill_secret|type|press|select|submit|drag|upload|login|hover|scroll|move_cursor)$/.test(cmd)) return "act";
     return "read";
   }
-  function diaryTrack(client, cmd, host, title, ok) {
+  function diaryTrack(client, cmd, host, title, ok, args) {
     if (!host || !MEM || String(cmd || "").startsWith("memory")) return;
     const c = client || "Claude externo";
+    // Alvos/rotas SEM valores (privacidade): seletor de campo diz "mexeu no quê"; path diz "em qual
+    // tela". Valores digitados NUNCA entram (o agente também digita senhas/dados sensíveis).
+    const a = args || {};
+    let field = "", pth = "";
+    if (/^(fill|fill_secret|type|select|click|submit|upload)$/.test(cmd) && (a.selector || a.ref)) field = String(a.selector || ("ref:" + a.ref)).slice(0, 40);
+    if ((cmd === "navigate" || cmd === "open_tab") && a.url) { try { pth = new URL(a.url).pathname.slice(0, 60); } catch (_) {} }
     diaryQ(async () => {
       const now = Date.now();
       const buf = (await chrome.storage.local.get(DIARY_BUF_KEY))[DIARY_BUF_KEY] || {};
@@ -430,6 +436,9 @@
       if (tt) h.t = tt.slice(0, 70);
       s.cats[diaryCat(cmd)]++;
       if (!ok) s.err++;
+      if (!s.f) s.f = {}; if (!s.p) s.p = {}; // sessões antigas no buffer não têm os campos novos
+      if (field && (s.f[field] || Object.keys(s.f).length < 8)) s.f[field] = (s.f[field] || 0) + 1;
+      if (pth && (s.p[pth] || Object.keys(s.p).length < 3)) s.p[pth] = (s.p[pth] || 0) + 1;
       buf[c] = s;
       await chrome.storage.local.set({ [DIARY_BUF_KEY]: buf });
     });
@@ -445,7 +454,12 @@
     if (s.cats.nav) parts.push(s.cats.nav + " navegações");
     if (s.cats.read) parts.push(s.cats.read + " leituras");
     if (s.err) parts.push(s.err + " erros");
-    return hm(s.start) + "–" + hm(s.last) + " · " + client + " agiu em " + hosts + extra + " · " + parts.join(", ");
+    let tail = "";
+    const fs_ = Object.entries(s.f || {}).sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k]) => k);
+    if (fs_.length) tail += " · alvos: " + fs_.join(", ");
+    const ps = Object.keys(s.p || {}).slice(0, 2);
+    if (ps.length) tail += " · rotas: " + ps.join(", ");
+    return hm(s.start) + "–" + hm(s.last) + " · " + client + " agiu em " + hosts + extra + " · " + parts.join(", ") + tail;
   }
   async function diaryFlushSession(client, s) {
     if (!s || !s.total) return true; // nada a gravar = "sucesso" (pode descartar)

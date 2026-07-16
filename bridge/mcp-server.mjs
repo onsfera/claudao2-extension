@@ -274,10 +274,24 @@ const TOOLS = [
   { name: "memory_list", cmd: "memory_list", description: "Lista os documentos de memória do Claudão² (nome, se é fixado no contexto, tamanho).", inputSchema: { type: "object", properties: {} } },
   { name: "memory_read", cmd: "memory_read", description: "Lê o conteúdo completo de um documento de memória.", inputSchema: { type: "object", properties: { name: { type: "string", description: "ex.: perfil.md, memoria-viva.md" } }, required: ["name"] } },
   { name: "memory_search", cmd: "memory_search", description: "Busca por relevância nos documentos de memória não-fixados e retorna os trechos mais relevantes à consulta.", inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
-  { name: "memory_append", cmd: "memory_append", description: "Acrescenta um fato durável à memória (arquivo padrão memoria-viva.md, ou 'file' específico). Faz dedup automático.", inputSchema: { type: "object", properties: { text: { type: "string" }, file: { type: "string", description: "arquivo alvo, opcional" } }, required: ["text"] } },
+  { name: "memory_append", cmd: "memory_append", description: "Acrescenta um fato durável à memória compartilhada (arquivo padrão memoria-viva.md, ou 'file' específico). Faz dedup automático. USE SEM SER PEDIDO ao concluir tarefas que ALTERARAM estado em sites (configs, campanhas, DNS, cadastros, publicações): uma linha com o que mudou (antes→depois), onde, por quê e quando medir — é assim que 'o que fizemos e por quê' fica recuperável dias depois. Nunca inclua senhas/tokens.", inputSchema: { type: "object", properties: { text: { type: "string" }, file: { type: "string", description: "arquivo alvo, opcional" } }, required: ["text"] } },
   { name: "memory_write", cmd: "memory_write", description: "Cria ou sobrescreve um documento de memória inteiro. Use pinned=true para deixá-lo sempre no contexto.", inputSchema: { type: "object", properties: { name: { type: "string" }, content: { type: "string" }, pinned: { type: "boolean" } }, required: ["name", "content"] } },
   { name: "memory_delete", cmd: "memory_delete", description: "Apaga um documento de memória.", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
 ];
+
+// Instruções de sistema entregues a TODO editor no initialize (viram parte do contexto do modelo).
+// É o que torna a memória AUTOMÁTICA: o agente registra intenção sem o usuário pedir em cada prompt.
+const SERVER_INSTRUCTIONS = `O Claudão² tem MEMÓRIA PERSISTENTE compartilhada entre você, outros editores e o Claude do painel do Chrome. Use-a AUTOMATICAMENTE, sem esperar o usuário pedir:
+1. INÍCIO de tarefa que referencie trabalho passado ("continue", "como da última vez", "o que fizemos em X", "mede o resultado de Y"): consulte memory_search antes de agir.
+2. FIM de tarefa em que você ALTEROU estado em algum site (configurações, campanhas, DNS, cadastros, preços, publicações): registre via memory_append UMA linha objetiva com O QUE mudou (antes → depois quando souber), ONDE (site/página), POR QUÊ (hipótese/objetivo) e QUANDO MEDIR, se aplicável. Ex.: "Google Ads Arqplace: lance da campanha Vasos 2,50→3,20 (hipótese: CTR baixo); medir CTR em 7 dias".
+3. Decisões e aprendizados duráveis (o que funcionou, o que quebrou, preferências do usuário) também merecem memory_append.
+4. NUNCA registre senhas, tokens ou valores sensíveis; nomes de campos, intenções e hipóteses sim.
+Um diário automático já registra ONDE/QUANDO você agiu; o seu memory_append é o que preserva O QUE e O PORQUÊ.`;
+
+let actionCalls = 0; // lembrete periódico: em tarefas longas o modelo esquece as instruções iniciais
+const NUDGE_EVERY = 12;
+const NUDGE_TOOLS = new Set(["browser_click", "browser_fill", "browser_fill_secret", "browser_type", "browser_press", "browser_select", "browser_submit", "browser_drag", "browser_upload", "browser_login", "browser_navigate"]);
+const NUDGE_TEXT = "\n\n[memória Claudão²] Tarefa longa em andamento: se já houve alteração relevante em algum site, registre AGORA via memory_append o que mudou e por quê (uma linha). Se nada mudou de estado, ignore.";
 
 async function callTool(name, args) {
   const tool = TOOLS.find((t) => t.name === name);
@@ -307,7 +321,9 @@ async function callTool(name, args) {
     return { content };
   }
   const r = reply.result;
-  return { content: [{ type: "text", text: (typeof r === "string" ? r : JSON.stringify(r, null, 2)) || "(vazio)" }] };
+  let text = (typeof r === "string" ? r : JSON.stringify(r, null, 2)) || "(vazio)";
+  if (NUDGE_TOOLS.has(name) && ++actionCalls % NUDGE_EVERY === 0) text += NUDGE_TEXT;
+  return { content: [{ type: "text", text }] };
 }
 
 // ---------------------------------------------------------------------------
@@ -320,7 +336,7 @@ async function handle(msg) {
   if (method === "initialize") {
     if (params && params.clientInfo && params.clientInfo.name) clientName = params.clientInfo.name;
     log("cliente MCP:", clientName);
-    send({ jsonrpc: "2.0", id, result: { protocolVersion: (params && params.protocolVersion) || "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "claudao2-bridge", version: "1.0.0" } } });
+    send({ jsonrpc: "2.0", id, result: { protocolVersion: (params && params.protocolVersion) || "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "claudao2-bridge", version: "1.0.0" }, instructions: SERVER_INSTRUCTIONS } });
     return;
   }
   if (method === "notifications/initialized" || method === "notifications/cancelled") return;

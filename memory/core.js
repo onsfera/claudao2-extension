@@ -406,7 +406,11 @@
         "    MEMÓRIA: <fato conciso>                             -> adiciona em memoria-viva.md\n" +
         "    MEMÓRIA[arquivo.md]: <fato conciso>                 -> adiciona no arquivo indicado\n" +
         "    MEMÓRIA-APAGAR[arquivo.md]: <trecho>                -> apaga as LINHAS que contêm o trecho\n" +
-        "    MEMÓRIA-SUBSTITUIR[arquivo.md]: <antigo> >>> <novo> -> substitui o texto no arquivo\n";
+        "    MEMÓRIA-SUBSTITUIR[arquivo.md]: <antigo> >>> <novo> -> substitui o texto no arquivo\n" +
+        "REGISTRE SEM SER PEDIDO (auto-journaling): sempre que a conversa produzir uma DECISÃO,\n" +
+        "uma ALTERAÇÃO feita em site/sistema, uma estratégia com hipótese a medir depois, ou um\n" +
+        "fato durável novo, inclua a(s) linha(s) MEMÓRIA: correspondentes na resposta — o quê\n" +
+        "mudou, por quê, e quando medir. Nunca registre senhas ou dados sensíveis.\n";
       let body = pinned
         .map((d) => `\n----- ${d.name} -----\n${d.content.trim()}`)
         .join("\n");
