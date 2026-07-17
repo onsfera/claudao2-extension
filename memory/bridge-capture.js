@@ -42,17 +42,82 @@
     push("error", ["unhandledrejection: " + ((r && (r.message || r.stack)) || r)]);
   });
 
+  // --- Memória INVISÍVEL nas abas do claude.ai ---
+  // O painel injeta o bloco de memória no `system` do POST /v1/messages (invisível). Nas abas
+  // claude.ai o content script roda em mundo ISOLADO e NÃO alcança o window.fetch da página, então
+  // a memória caía no CAMPO DE MENSAGEM (visível). Aqui (mundo MAIN) fazemos a injeção no `system`,
+  // como o painel. Este mundo NÃO acessa chrome.storage: o bloco é computado no mundo isolado
+  // (inject.js) e entregue por postMessage. Gated em claude.ai (o script roda em <all_urls>; sem
+  // isso, memória vazaria em qualquer site que POSTasse pra uma URL /v1/messages).
+  const CM_ON_CLAUDE = /(^|\.)claude\.ai$/i.test(location.hostname);
+  const CM_MEM_TAG = "=== MEMÓRIA PERSISTENTE DO CLAUDE";
+  // LIMITAÇÃO CONHECIDA: MAIN e ISOLADO só se falam pelo DOM compartilhado (postMessage) — qualquer
+  // código in-page (a própria claude.ai, outra extensão em mundo MAIN, ou um XSS na claude.ai) pode
+  // observar o bloco. É inerente a qualquer canal MAIN↔isolado; o risco é baixo (essas ameaças já
+  // leem tudo que o usuário digita/vê na claude.ai) e é melhor que o estado anterior (texto visível
+  // no campo de mensagem). O `system` já leva esse bloco pro backend de qualquer forma.
+  let cmMemSeq = 0; const cmMemPending = new Map();
+  let cmResponderReady = false; // o mundo isolado anuncia "ready" ao instalar o responder
+  window.addEventListener("message", (e) => {
+    if (e.source !== window) return;
+    const d = e.data;
+    if (!d || d.__cmMem == null) return;
+    if (d.__cmMem === "ready") { cmResponderReady = true; return; }
+    if (d.__cmMem === "block" && cmMemPending.has(d.id)) { const r = cmMemPending.get(d.id); cmMemPending.delete(d.id); r(d.block || ""); }
+  });
+  function cmRequestMemBlock(query) {
+    return new Promise((resolve) => {
+      const id = ++cmMemSeq; cmMemPending.set(id, resolve);
+      try { window.postMessage({ __cmMem: "need", id, query: query || "" }, location.origin); }
+      catch (_) { cmMemPending.delete(id); return resolve(""); }
+      setTimeout(() => { if (cmMemPending.has(id)) { cmMemPending.delete(id); resolve(""); } }, 800); // fallback: nunca trava o envio
+    });
+  }
+  function cmLastUserText(p) {
+    try { const msgs = p.messages || [];
+      for (let i = msgs.length - 1; i >= 0; i--) { const m = msgs[i]; if (m.role !== "user") continue;
+        if (typeof m.content === "string") return m.content;
+        if (Array.isArray(m.content)) return m.content.filter((b) => b && (b.type === "text" || typeof b.text === "string")).map((b) => b.text || "").join(" "); }
+    } catch (_) {} return "";
+  }
+  function cmIsUtility(p) { // pula geração de título (mesma heurística do painel)
+    try { const all = (p.messages || []).map((m) => typeof m.content === "string" ? m.content : (Array.isArray(m.content) ? m.content.map((b) => (b && b.text) || "").join(" ") : "")).join(" ");
+      return /suggest a title based on|between <title> tags/i.test(all);
+    } catch (_) { return false; }
+  }
+  async function cmInjectMemory(input, init) {
+    if (!cmResponderReady) return [input, init]; // responder isolado ainda não carregou (ou inject.js abortou): pula NA HORA, sem pagar timeout
+    let bodyText = null;
+    if (init && typeof init.body === "string") bodyText = init.body;
+    else if (typeof Request !== "undefined" && input instanceof Request) { try { bodyText = await input.clone().text(); } catch (_) {} }
+    if (!bodyText) return [input, init];
+    let p; try { p = JSON.parse(bodyText); } catch (_) { return [input, init]; }
+    if (!p || !Array.isArray(p.messages) || cmIsUtility(p)) return [input, init];
+    if (JSON.stringify(p.system || "").includes(CM_MEM_TAG)) return [input, init]; // já injetado (dedup)
+    const block = await cmRequestMemBlock(cmLastUserText(p));
+    if (!block) return [input, init];
+    if (Array.isArray(p.system)) p.system.push({ type: "text", text: block });
+    else if (typeof p.system === "string" && p.system) p.system = p.system + "\n\n" + block;
+    else p.system = block;
+    const newBody = JSON.stringify(p);
+    if (init && typeof init.body === "string") return [input, Object.assign({}, init, { body: newBody })];
+    return [new Request(input, { body: newBody, method: "POST" }), init];
+  }
+
   // --- Captura de rede (fetch + XHR) para browser_network ---
   const net = (window.__claudaoNet = window.__claudaoNet || []);
   const rec = (o) => { net.push(o); if (net.length > 300) net.shift(); };
   try {
     const of = window.fetch;
     if (of && !of.__cmWrapped) {
-      const wf = function (input, init) {
+      const wf = async function (input, init) {
         const url = typeof input === "string" ? input : (input && input.url) || "";
         const method = ((init && init.method) || (typeof input === "object" && input.method) || "GET").toUpperCase();
+        if (CM_ON_CLAUDE && method === "POST" && /\/v1\/messages(?:\?|$)/.test(url)) {
+          try { [input, init] = await cmInjectMemory(input, init); } catch (_) {}
+        }
         const t0 = performance.now();
-        return of.apply(this, arguments).then(
+        return of.call(this, input, init).then(
           (res) => { rec({ type: "fetch", method, url, status: res.status, ms: Math.round(performance.now() - t0), t: Date.now() }); return res; },
           (err) => { rec({ type: "fetch", method, url, status: 0, error: String(err && err.message || err), ms: Math.round(performance.now() - t0), t: Date.now() }); throw err; }
         );

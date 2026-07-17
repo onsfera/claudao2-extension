@@ -331,6 +331,25 @@
   }
   patchFetch();
 
+  // Responder do mundo MAIN (bridge-capture): nas abas do claude.ai o fetch é interceptado LÁ
+  // (o mundo isolado não alcança o window.fetch da página); ele nos manda a query e devolvemos o
+  // bloco de memória composto (só nós temos acesso ao chrome.storage). Substitui o auto-inject no
+  // composer (que aparecia como texto no campo de mensagem). Respeita o toggle autoInject.
+  if (!IS_SIDEPANEL) {
+    window.addEventListener("message", async (e) => {
+      if (e.source !== window) return;
+      const d = e.data;
+      if (!d || d.__cmMem !== "need") return;
+      let block = "";
+      try { if (settings.autoInject) block = await M.compose(d.query || ""); } catch (_) {}
+      try { window.postMessage({ __cmMem: "block", id: d.id, block }, location.origin); } catch (_) {}
+    });
+    // Anuncia que o responder está pronto → o MAIN (que já escuta desde document_start) só tenta
+    // injetar depois disto (senão pularia NA HORA, sem pagar timeout). Uma vez basta: ambos os
+    // scripts persistem pela vida da página (navegação SPA não recarrega content script).
+    try { window.postMessage({ __cmMem: "ready" }, location.origin); } catch (_) {}
+  }
+
   // ---------------------------------------------------------------------------
   // Idioma (troca ao vivo)
   // ---------------------------------------------------------------------------
@@ -1332,15 +1351,10 @@
   // ---------------------------------------------------------------------------
   let autoInjectDone = false;
   async function maybeAutoInject() {
-    if (IS_SIDEPANEL) return;
-    if (autoInjectDone || !settings.autoInject) return;
-    const el = getComposer();
-    if (!el || !composerIsEmpty(el)) return;
-    const block = await M.compose();
-    if (!block) return;
-    autoInjectDone = true;
-    insertIntoComposer(block);
-    toast(t("t_auto"));
+    // APOSENTADO: a memória agora entra INVISÍVEL no `system` do request (via bridge-capture, mundo
+    // MAIN + o responder de postMessage acima), em vez de ser despejada no CAMPO DE MENSAGEM. Mantido
+    // como no-op p/ não quebrar as chamadas no loop de montagem da UI.
+    return;
   }
   let lastUrl = location.href;
   function watchUrl() { if (location.href !== lastUrl) { lastUrl = location.href; autoInjectDone = false; } }
