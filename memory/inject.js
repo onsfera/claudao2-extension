@@ -376,9 +376,10 @@
   // assistant ao vivo, via SSE) segue no mesmo fluxo — indistinguível de continuação real. Não toca
   // no React nativo: overlay opaco por cima da lista (o composer sticky segue visível/interativo).
   // ---------------------------------------------------------------------------
-  function ovBubble(role, text, ts) {
+  function ovBubble(role, text, ts, dayTs) {
+    if (dayTs == null) dayTs = ts; // dia efetivo (cai pro dia da conversa quando a msg não tem ts)
     const wrap = h("div", { className: "cm-ov-msg " + (role === "user" ? "user" : "asst") });
-    if (ts) wrap.dataset.day = dayLabel(ts); // usado pelo header de data flutuante ao rolar
+    if (dayTs != null) wrap.dataset.day = dayLabel(dayTs); // header flutuante/separador usam o dia efetivo
     wrap.appendChild(h("div", { className: "cm-ov-time", textContent: (role === "user" ? t("you") : t("claude")) + (ts ? " · " + hhmm(ts) : "") }));
     const b = h("div", { className: "cm-ov-bubble", textContent: text || "" });
     wrap.appendChild(b);
@@ -408,11 +409,13 @@
     if (!resumeOv) return;
     resumeOv.innerHTML = ""; ovLastDay = "";
     resumeOv.appendChild(h("div", { className: "cm-ov-datehdr" })); // pill flutuante de data (aparece ao rolar)
+    const convTs = conv.startedAt || conv.updatedAt || null; // fallback de dia p/ conversas antigas sem ts por mensagem
     for (const m of (conv.messages || [])) {
       const prose = m.role === "user" ? extractUserText(proseOnly(m.content)) : proseOnly(m.content);
       if (!prose || !prose.trim()) continue; // SÓ o que foi escrito (ações/tool/memória ficam fora do visual)
-      ovMaybeDay(m.ts);
-      resumeOv.appendChild(ovBubble(m.role, prose.trim(), m.ts).wrap);
+      const dayTs = m.ts != null ? m.ts : convTs;
+      ovMaybeDay(dayTs);
+      resumeOv.appendChild(ovBubble(m.role, prose.trim(), m.ts, dayTs).wrap);
     }
     resumeOv.appendChild(h("div", { className: "cm-ov-hint", textContent: t("continue_here") }));
   }
@@ -885,13 +888,23 @@
   let currentConv = null;
   function closeConvMenus() { if (shadow) shadow.querySelectorAll(".cm-conv-menu").forEach((m) => m.remove()); }
 
+  // Conta só as mensagens VISÍVEIS (prosa user/assistant) — não o array cru, que infla com os
+  // blocos tool_use/tool_result do loop do agente (1 pergunta virava "55 mensagens").
+  function visibleMsgCount(conv) {
+    let n = 0;
+    for (const m of ((conv && conv.messages) || [])) {
+      const prose = m.role === "user" ? extractUserText(proseOnly(m.content)) : proseOnly(m.content);
+      if (prose && prose.trim()) n++;
+    }
+    return n;
+  }
   function convCardNormal(card, c) {
     card.className = "cm-card cm-conv-card";
     card.innerHTML = "";
     const icon = h("span", { className: "cm-card-ic" }); icon.innerHTML = ico("messages-square", 16);
     const mid = h("div", { className: "cm-card-mid" }, [
       h("div", { className: "cm-card-name cm-conv-title", textContent: c.title || "(sem título)" }),
-      h("div", { className: "cm-card-prev", textContent: new Date(c.updatedAt).toLocaleString() + " · " + t("msgs_count", { n: (c.messages || []).length }) }),
+      h("div", { className: "cm-card-prev", textContent: new Date(c.updatedAt).toLocaleString() + " · " + t("msgs_count", { n: visibleMsgCount(c) }) }),
     ]);
     const menuBtn = h("button", { className: "cm-conv-menu-btn" });
     menuBtn.innerHTML = ico("more-vertical", 16);
