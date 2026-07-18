@@ -33,6 +33,33 @@
   const STATUS_KEY = "cm_bridge_status";   // {hubConnected, ts}
   const ACTIVE_KEY = "cm_external_active";  // {active, client, tab, ts}
   const ENABLED_KEY = "cm_bridge_enabled"; // opt-in: só conecta quando ligado
+  // -------------------------------------------------------------------------
+  // Auto-update: a extensão é unpacked (sem update da Web Store). Checa a versão do manifest no
+  // repo PÚBLICO (raw) e avisa. Se o bridge está conectado, o botão "Atualizar agora" pede um
+  // git pull ao bridge (processo Node local) e recarrega a extensão. Repo público → pull sem auth.
+  // -------------------------------------------------------------------------
+  const UPDATE_KEY = "cm_update";
+  const REPO_URL = "https://github.com/onsfera/claudao2-extension";
+  const MANIFEST_RAW = "https://raw.githubusercontent.com/onsfera/claudao2-extension/main/manifest.json";
+  function cmpVer(a, b) { // compara versões "x.y.z" componente a componente (>0 se a>b)
+    const pa = String(a || "0").split("."), pb = String(b || "0").split(".");
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) { const x = parseInt(pa[i] || "0", 10), y = parseInt(pb[i] || "0", 10); if (x !== y) return x - y; }
+    return 0;
+  }
+  async function checkUpdate(force) {
+    const now = Date.now();
+    // Throttle PERSISTIDO (o SW do MV3 morre e re-executa o topo, zerando qualquer var em memória):
+    // usa o ts do último resultado gravado. No máx 1x a cada 6h (o alarm dispara a cada 30s).
+    if (!force) { try { const prev = (await chrome.storage.local.get(UPDATE_KEY))[UPDATE_KEY]; if (prev && prev.ts && now - prev.ts < 6 * 3600 * 1000) return; } catch (_) {} }
+    try {
+      const res = await fetch(MANIFEST_RAW + "?t=" + now, { cache: "no-store" });
+      if (!res.ok) return;
+      const m = await res.json();
+      const latest = m && m.version; if (!latest) return;
+      const current = chrome.runtime.getManifest().version;
+      await chrome.storage.local.set({ [UPDATE_KEY]: { current, latest, hasUpdate: cmpVer(latest, current) > 0, url: REPO_URL, ts: now } });
+    } catch (_) {}
+  }
   const LOG_KEY = "cm_bridge_log";          // ring buffer de ações (auditoria no painel)
   const ALLOW_KEY = "cm_bridge_allowlist";  // domínios onde ações são permitidas
   const CONSENT_KEY = "cm_bridge_consent";  // pedido pendente de aprovação (SW -> painel)
@@ -99,6 +126,15 @@
         try { chrome.storage.local.set({ cm_bridge_paths: { install: msg.installPath || "", server: msg.serverPath || "", ts: Date.now() } }); } catch (_) {}
         return;
       }
+      // Resultado do git pull ("Atualizar agora"): se deu certo, recarrega a extensão (relê o disco).
+      if (msg && msg.type === "cm_self_update_result") {
+        if (msg.ok) { try { chrome.storage.local.set({ cm_update_state: { applying: false, ok: true, ts: Date.now() } }); } catch (_) {} setTimeout(() => { try { chrome.runtime.reload(); } catch (_) {} }, 400); }
+        else { try { chrome.storage.local.set({ cm_update_state: { applying: false, ok: false, error: String(msg.error || "").slice(0, 200), ts: Date.now() } }); } catch (_) {} }
+        return;
+      }
+      // Keepalive do bridge (a cada 20s): refresca o ts do status → o botão "Atualizar agora" (gated
+      // por status fresco < 60s) não some enquanto o bridge está conectado.
+      if (msg && msg.type === "keepalive") { setStatus(true); return; }
       if (!msg || !msg.cmd) return;
       let reply, tabId = null, host = "", tabTitle = "";
       try {
@@ -209,6 +245,13 @@
         vaultSave(msg.item).then((r) => sendResponse({ ok: true, result: r })).catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
         return true; // resposta assíncrona
       }
+      // Auto-update: painel pede pra re-checar ou pra aplicar (git pull via bridge → reload).
+      if (msg && msg.cm_update === "check") { checkUpdate(true).then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false })); return true; }
+      if (msg && msg.cm_update === "apply") {
+        if (ws && ws.readyState === 1) { try { chrome.storage.local.set({ cm_update_state: { applying: true, ts: Date.now() } }); ws.send(JSON.stringify({ type: "cm_self_update" })); sendResponse({ ok: true }); } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); } }
+        else sendResponse({ ok: false, error: "bridge não conectado" });
+        return true;
+      }
       // Pausa/Retoma GRANULAR: a página não sabe seu tabId → o SW pega de sender.tab.id.
       if (msg && msg.cm_pause && sender && sender.tab) { pauseTab(sender.tab.id, msg.reason); return; }
       if (msg && msg.cm_resume && sender && sender.tab) { resumeTab(sender.tab.id); return; }
@@ -224,7 +267,7 @@
       if (a.name === "cm_bridge_keepalive" && enabled && (!ws || ws.readyState > 1)) connect();
       // O alarm sobrevive à morte do SW e o re-acorda: fecha sessões órfãs do diário
       // (agente parou e o SW morreu antes do gap — sem isso o resumo nunca seria gravado).
-      if (a.name === "cm_bridge_keepalive") diaryFlushStale();
+      if (a.name === "cm_bridge_keepalive") { diaryFlushStale(); checkUpdate(); } // checkUpdate se auto-limita a 1x/6h
     });
   } catch (_) {}
   try { chrome.runtime.onStartup.addListener(() => { if (enabled) connect(); }); } catch (_) {}
@@ -241,6 +284,7 @@
     } catch (_) {}
     if (enabled) connect();
   })();
+  checkUpdate(); // checa nova versão no boot (e depois a cada 6h pelo alarm)
 
   // Instalou/recarregou a extensão = pode ter TROCADO de pasta/bridge. O caminho exibido
   // (cm_bridge_paths) é herança do ÚLTIMO bridge que conectou — se era o de outra pasta, ficava

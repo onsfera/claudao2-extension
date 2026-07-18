@@ -19,6 +19,7 @@ import net from "node:net";
 import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = path.join(HERE, "mcp-server.mjs");
@@ -26,6 +27,19 @@ const INSTALL_PATH = path.join(HERE, "install.mjs");
 
 const PORT = Number(process.env.CLAUDAO_BRIDGE_PORT || 8765);
 const log = (...a) => process.stderr.write("[claudao2-bridge] " + a.join(" ") + "\n");
+
+// Botão "Atualizar agora" da extensão: git pull na pasta da extensão (pai do bridge). Repo público
+// → pull sem auth. execFile (sem shell) = mais seguro e menos ruído pro antivírus. --ff-only não
+// cria merge (falha limpo se houver mudança local não commitada).
+function doSelfUpdate(conn) {
+  const dir = path.dirname(HERE); // .../<extensão>/bridge → .../<extensão> (o repo git)
+  execFile("git", ["-C", dir, "pull", "--ff-only"], { timeout: 90000, windowsHide: true }, (err, stdout, stderr) => {
+    const ok = !err;
+    const out = String((ok ? stdout : (stderr || (err && err.message))) || "").replace(/\s+/g, " ").trim().slice(0, 400);
+    log("self-update:", ok ? "ok" : "falhou", out.slice(0, 120));
+    try { conn.send(JSON.stringify({ type: "cm_self_update_result", ok, output: ok ? out : undefined, error: ok ? undefined : (out || "git pull falhou") })); } catch (_) {}
+  });
+}
 
 let clientName = "Claude externo"; // preenchido no initialize (clientInfo.name)
 
@@ -149,6 +163,7 @@ function onUpgrade(req, socket) {
     conn.onMessage = (data) => {
       let m; try { m = JSON.parse(data); } catch { return; }
       if (m.type === "hello") { log("hello:", JSON.stringify(m.info || {})); return; }
+      if (m.type === "cm_self_update") { doSelfUpdate(conn); return; } // botão "Atualizar agora": git pull na pasta da extensão
       const p = pending.get(m.id); if (!p) return;
       clearTimeout(p.timer); pending.delete(m.id);
       if (p.editorConn) { try { p.editorConn.send(JSON.stringify({ rid: p.rid, ok: m.ok, result: m.result, error: m.error })); } catch (_) {} }

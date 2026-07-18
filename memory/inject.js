@@ -169,6 +169,7 @@
       no_conversations: "Nenhuma conversa salva ainda.", msgs_count: "%n% mensagens", continue_conv: "Continuar esta conversa",
       conv_reopened: "Continuando esta conversa — é só escrever.", continuing: "Continuando", stop_continue: "Encerrar continuação", delete_conv_confirm: "Apagar esta conversa salva?",
       view_history: "Ver histórico", confirm_close: "Clique de novo para fechar e iniciar uma conversa nova", new_conversation: "Nova conversa iniciada.", today: "Hoje", yesterday: "Ontem", continue_here: "Continue escrevendo abaixo para seguir a conversa", back_to_list: "Voltar à lista de conversas",
+      update_available: "Nova versão %v% disponível", view_on_github: "Ver no GitHub", update_now: "Atualizar agora", updating: "Atualizando…", update_failed: "Falha ao atualizar",
       conv_deleted: "Conversa apagada.", you: "Você", claude: "Claude", lang_changed: "Idioma alterado.",
       rename_conv: "Editar nome", delete_conv: "Excluir", rename_prompt: "Novo nome da conversa:", cancel: "Cancelar",
     },
@@ -177,6 +178,7 @@
       no_conversations: "No saved conversations yet.", msgs_count: "%n% messages", continue_conv: "Continue this conversation",
       conv_reopened: "Continuing this conversation — just type.", continuing: "Continuing", stop_continue: "Stop continuing", delete_conv_confirm: "Delete this saved conversation?",
       view_history: "View history", confirm_close: "Click again to close and start a new conversation", new_conversation: "New conversation started.", today: "Today", yesterday: "Yesterday", continue_here: "Keep typing below to continue the conversation", back_to_list: "Back to conversation list",
+      update_available: "New version %v% available", view_on_github: "View on GitHub", update_now: "Update now", updating: "Updating…", update_failed: "Update failed",
       conv_deleted: "Conversation deleted.", you: "You", claude: "Claude", lang_changed: "Language changed.",
       rename_conv: "Rename", delete_conv: "Delete", rename_prompt: "New conversation name:", cancel: "Cancel",
     },
@@ -185,6 +187,7 @@
       no_conversations: "Aún no hay conversaciones guardadas.", msgs_count: "%n% mensajes", continue_conv: "Continuar esta conversación",
       conv_reopened: "Continuando esta conversación — solo escribe.", continuing: "Continuando", stop_continue: "Terminar continuación", delete_conv_confirm: "¿Eliminar esta conversación guardada?",
       view_history: "Ver historial", confirm_close: "Haz clic de nuevo para cerrar e iniciar una conversación nueva", new_conversation: "Nueva conversación iniciada.", today: "Hoy", yesterday: "Ayer", continue_here: "Sigue escribiendo abajo para continuar la conversación", back_to_list: "Volver a la lista de conversaciones",
+      update_available: "Nueva versión %v% disponible", view_on_github: "Ver en GitHub", update_now: "Actualizar ahora", updating: "Actualizando…", update_failed: "Error al actualizar",
       conv_deleted: "Conversación eliminada.", you: "Tú", claude: "Claude", lang_changed: "Idioma cambiado.",
       rename_conv: "Editar nombre", delete_conv: "Eliminar", rename_prompt: "Nuevo nombre de la conversación:", cancel: "Cancelar",
     },
@@ -278,6 +281,7 @@
     if (changes[PAUSE_KEY]) applyPaused(changes[PAUSE_KEY].newValue);
     if (changes[HANDOFF_KEY]) applyHandoff(changes[HANDOFF_KEY].newValue);
     if (changes[STATUS_KEY] || changes[ENABLED_KEY] || changes[PATHS_KEY]) refreshConnect();
+    if ((changes["cm_update"] || changes["cm_update_state"] || changes[STATUS_KEY]) && panel && panel.style.display !== "none" && curScreen === "list") renderUpdateCard();
     if (changes[CONSENT_KEY]) applyConsent(changes[CONSENT_KEY].newValue);
     if ((changes[LOG_KEY] || changes[ALLOW_KEY]) && curScreen === "security") refreshSecurity();
     if (changes[VAULT_KEY] && curScreen === "vault") refreshVault();
@@ -1155,7 +1159,42 @@
   function docPreview(content) {
     return (content || "").split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#")).join(" ").slice(0, 110);
   }
+  // Aviso de nova versão (a extensão é unpacked). "Ver no GitHub" sempre; "Atualizar agora" só se o
+  // bridge está conectado (ele faz o git pull). O estado vem do service worker (checkUpdate → cm_update).
+  async function renderUpdateCard() {
+    const slot = $("#cm-update-slot"); if (!slot) return;
+    slot.innerHTML = "";
+    let up = null, st = null, up2 = null;
+    try { const g = await chrome.storage.local.get(["cm_update", STATUS_KEY, "cm_update_state"]); up = g.cm_update; st = g[STATUS_KEY]; up2 = g.cm_update_state; } catch (_) {}
+    if (!up || !up.hasUpdate) return;
+    const bridgeUp = !!(st && st.hubConnected && Date.now() - (st.ts || 0) < 60000);
+    const card = h("div", { className: "cm-update-card" });
+    card.appendChild(h("div", { className: "cm-update-title", textContent: "✨ " + t("update_available", { v: up.latest }) }));
+    const row = h("div", { className: "cm-update-actions" });
+    const gh = h("button", { className: "cm-update-gh" }); gh.innerHTML = ico("external-link", 14) + " " + t("view_on_github");
+    gh.addEventListener("click", () => { try { chrome.tabs.create({ url: up.url }); } catch (_) { try { window.open(up.url, "_blank"); } catch (__) {} } });
+    row.appendChild(gh);
+    if (bridgeUp) {
+      const applying = !!(up2 && up2.applying && Date.now() - (up2.ts || 0) < 120000); // 120s > timeout do git (90s): se o WS cair no meio, o botão não trava eterno
+      const btn = h("button", { className: "cm-update-now" });
+      btn.innerHTML = applying ? t("updating") : ico("rotate-ccw", 14) + " " + t("update_now");
+      btn.disabled = applying;
+      btn.addEventListener("click", () => {
+        btn.disabled = true; btn.textContent = t("updating");
+        try {
+          chrome.runtime.sendMessage({ cm_update: "apply" }, (r) => {
+            if (!(r && r.ok)) { btn.disabled = false; btn.innerHTML = ico("rotate-ccw", 14) + " " + t("update_now"); toast((r && r.error) || t("update_failed"), false); }
+          });
+        } catch (_) { btn.disabled = false; }
+      });
+      row.appendChild(btn);
+    }
+    card.appendChild(row);
+    if (up2 && up2.ok === false && up2.error) card.appendChild(h("div", { className: "cm-update-err", textContent: "⚠ " + up2.error }));
+    slot.appendChild(card);
+  }
   async function refreshList() {
+    renderUpdateCard();
     const mem = await M.load();
     docsCache = mem.docs;
     $("#cm-auto-inject").checked = !!mem.settings.autoInject;
@@ -1783,6 +1822,7 @@
     </div>
 
     <div id="cm-screen-list" class="cm-screen">
+      <div id="cm-update-slot"></div>
       <div class="cm-hint">${t("pin_hint", { pin: ico("pin", 11) })}</div>
       <div id="cm-doclist"></div>
       <div class="cm-listactions">
@@ -2076,6 +2116,15 @@
       font-size: 10.5px; color: var(--dim); background: var(--field); border-radius: 11px; padding: 3px 12px; box-shadow: 0 1px 7px rgba(0,0,0,.22); }
     #cm-resume-overlay .cm-ov-datehdr.show { opacity: 1; }
     #cm-resumebar .cm-resume-rename { font: 600 12px system-ui, sans-serif; color: #fff; background: rgba(255,255,255,.2); border: 1px solid rgba(255,255,255,.45); border-radius: 6px; padding: 2px 7px; max-width: 52%; outline: none; }
+    /* Aviso de nova versão (card no topo da tela de memória) */
+    .cm-update-card { background: rgba(120,103,253,.14); border: 1px solid rgba(120,103,253,.42); border-radius: 10px; padding: 11px 12px; margin-bottom: 10px; }
+    .cm-update-title { font-size: 12.5px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
+    .cm-update-actions { display: flex; gap: 8px; }
+    .cm-update-card button { flex: 1; border-radius: 7px; padding: 7px 8px; font: 600 12px system-ui, sans-serif; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: 1px solid var(--border); }
+    .cm-update-gh { background: var(--field); color: var(--text); }
+    .cm-update-now { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .cm-update-now:disabled { opacity: .6; cursor: default; }
+    .cm-update-err { font-size: 11px; color: #ff6b6b; margin-top: 7px; }
 
     #toast { position: fixed; bottom: 72px; right: 18px; max-width: 320px; background: var(--head); color: var(--text);
       padding: 10px 14px; border-radius: 8px; box-shadow: 0 6px 20px var(--shadow); font-family: system-ui, sans-serif; font-size: 12px;
