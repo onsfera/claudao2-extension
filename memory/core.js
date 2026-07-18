@@ -398,6 +398,7 @@
         "=== MEMÓRIA PERSISTENTE DO CLAUDE (contexto durável sobre mim) ===\n" +
         "Você tem memória persistente entre conversas, em documentos markdown.\n" +
         "Arquivos: " + allNames + "\n" +
+        "Data e hora AGORA (fuso local do usuário): " + new Date().toLocaleString() + ". Use isto p/ saber quanto tempo passou desde a última mensagem (as mensagens retomadas trazem [horário] inline) — útil quando a tarefa depende de uma janela de soak/espera.\n" +
         "Abaixo vai o núcleo fixo + trechos recuperados por relevância à minha mensagem.\n" +
         "Você mesmo MANTÉM essa memória: para criar, editar ou apagar registros, escreva\n" +
         "um comando em LINHA ISOLADA em qualquer ponto da resposta (a extensão executa e\n" +

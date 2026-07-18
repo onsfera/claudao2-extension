@@ -87,6 +87,9 @@
       t_no_composer: "Não achei o campo de texto.", t_select_first: "Selecione um texto na página primeiro.",
       t_saved_in: "Salvo em %doc%.", t_copied: "Comando copiado.", t_copy_manual: "Copie manualmente o comando.",
       t_integ_on: "Integração VS Code ligada.", t_integ_off: "Integração VS Code desligada.",
+      t_capture_on: "Ativado: o que for conversado será salvo na memória e como histórico de chat.",
+      t_capture_off: "Desativado: nada será salvo na memória, nem criará histórico de conversa.",
+      capture_on_title: "Captura de memória: LIGADA (clique p/ desligar)", capture_off_title: "Captura de memória: DESLIGADA (clique p/ ligar)",
       t_doc_saved: "Documento salvo.", t_doc_inserted: "Documento inserido na conversa.",
       t_doc_deleted: "Documento apagado.", t_auto: "Memória inserida automaticamente.",
       new_doc_prompt: "Nome do novo documento (ex.: projetos.md):", delete_confirm: "Apagar o documento %doc%?",
@@ -116,6 +119,9 @@
       t_no_composer: "Couldn't find the text field.", t_select_first: "Select some text on the page first.",
       t_saved_in: "Saved to %doc%.", t_copied: "Command copied.", t_copy_manual: "Copy the command manually.",
       t_integ_on: "VS Code integration on.", t_integ_off: "VS Code integration off.",
+      t_capture_on: "On: what you talk about will be saved to memory and as chat history.",
+      t_capture_off: "Off: nothing will be saved to memory, and no chat history will be created.",
+      capture_on_title: "Memory capture: ON (click to turn off)", capture_off_title: "Memory capture: OFF (click to turn on)",
       t_doc_saved: "Document saved.", t_doc_inserted: "Document inserted into chat.",
       t_doc_deleted: "Document deleted.", t_auto: "Memory inserted automatically.",
       new_doc_prompt: "New document name (e.g. projects.md):", delete_confirm: "Delete document %doc%?",
@@ -145,6 +151,9 @@
       t_no_composer: "No encontré el campo de texto.", t_select_first: "Selecciona un texto en la página primero.",
       t_saved_in: "Guardado en %doc%.", t_copied: "Comando copiado.", t_copy_manual: "Copia el comando manualmente.",
       t_integ_on: "Integración VS Code activada.", t_integ_off: "Integración VS Code desactivada.",
+      t_capture_on: "Activado: lo que converses se guardará en la memoria y como historial de chat.",
+      t_capture_off: "Desactivado: nada se guardará en la memoria ni creará historial de conversación.",
+      capture_on_title: "Captura de memoria: ACTIVA (clic para desactivar)", capture_off_title: "Captura de memoria: DESACTIVADA (clic para activar)",
       t_doc_saved: "Documento guardado.", t_doc_inserted: "Documento insertado en el chat.",
       t_doc_deleted: "Documento eliminado.", t_auto: "Memoria insertada automáticamente.",
       new_doc_prompt: "Nombre del nuevo documento (ej.: proyectos.md):", delete_confirm: "¿Eliminar el documento %doc%?",
@@ -159,6 +168,7 @@
       lang_label: "Idioma", lang_auto: "Automático", conversations: "Conversas", history: "Histórico de conversas",
       no_conversations: "Nenhuma conversa salva ainda.", msgs_count: "%n% mensagens", continue_conv: "Continuar esta conversa",
       conv_reopened: "Continuando esta conversa — é só escrever.", continuing: "Continuando", stop_continue: "Encerrar continuação", delete_conv_confirm: "Apagar esta conversa salva?",
+      view_history: "Ver histórico", confirm_close: "Clique de novo para fechar e iniciar uma conversa nova", new_conversation: "Nova conversa iniciada.", today: "Hoje", yesterday: "Ontem",
       conv_deleted: "Conversa apagada.", you: "Você", claude: "Claude", lang_changed: "Idioma alterado.",
       rename_conv: "Editar nome", delete_conv: "Excluir", rename_prompt: "Novo nome da conversa:", cancel: "Cancelar",
     },
@@ -166,6 +176,7 @@
       lang_label: "Language", lang_auto: "Automatic", conversations: "Conversations", history: "Conversation history",
       no_conversations: "No saved conversations yet.", msgs_count: "%n% messages", continue_conv: "Continue this conversation",
       conv_reopened: "Continuing this conversation — just type.", continuing: "Continuing", stop_continue: "Stop continuing", delete_conv_confirm: "Delete this saved conversation?",
+      view_history: "View history", confirm_close: "Click again to close and start a new conversation", new_conversation: "New conversation started.", today: "Today", yesterday: "Yesterday",
       conv_deleted: "Conversation deleted.", you: "You", claude: "Claude", lang_changed: "Language changed.",
       rename_conv: "Rename", delete_conv: "Delete", rename_prompt: "New conversation name:", cancel: "Cancel",
     },
@@ -173,6 +184,7 @@
       lang_label: "Idioma", lang_auto: "Automático", conversations: "Conversaciones", history: "Historial de conversaciones",
       no_conversations: "Aún no hay conversaciones guardadas.", msgs_count: "%n% mensajes", continue_conv: "Continuar esta conversación",
       conv_reopened: "Continuando esta conversación — solo escribe.", continuing: "Continuando", stop_continue: "Terminar continuación", delete_conv_confirm: "¿Eliminar esta conversación guardada?",
+      view_history: "Ver historial", confirm_close: "Haz clic de nuevo para cerrar e iniciar una conversación nueva", new_conversation: "Nueva conversación iniciada.", today: "Hoy", yesterday: "Ayer",
       conv_deleted: "Conversación eliminada.", you: "Tú", claude: "Claude", lang_changed: "Idioma cambiado.",
       rename_conv: "Editar nombre", delete_conv: "Eliminar", rename_prompt: "Nuevo nombre de la conversación:", cancel: "Cancelar",
     },
@@ -258,7 +270,7 @@
     if (area !== "local") return;
     if (changes[M.KEY] && changes[M.KEY].newValue) {
       const s = changes[M.KEY].newValue.settings;
-      if (s) settings = s;
+      if (s) { settings = s; restyleCaptureBtn(); }
       // memória mudou (inclusive por escrita do Claude externo): atualiza a lista se aberta
       if (panel && panel.style.display !== "none" && $("#cm-screen-list") && $("#cm-screen-list").style.display !== "none") refreshList();
     }
@@ -303,10 +315,13 @@
             const payload = JSON.parse(bodyText);
             if (payload && Array.isArray(payload.messages) && !isUtilityCall(payload.messages)) {
               let modified = false;
-              const beforeLen = payload.messages.length;
-              handleOutgoing(payload);                 // sessão + continuação (pode prepender histórico)
+              const nativeMsgs = payload.messages || [];   // native ANTES do buildResumed
+              const beforeLen = nativeMsgs.length;
+              handleOutgoing(payload);                 // sessão + continuação (pode setar payload.messages = buildResumed)
               if (payload.messages.length !== beforeLen) modified = true;
-              recordConversation(payload.messages);    // salva o histórico (debounced)
+              // Grava o histórico em RAW (sem o "[hora]"/flatten que o buildResumed adiciona SÓ pro
+              // modelo) — senão o carimbo vazava pro conteúdo salvo e dobrava a cada reabertura.
+              recordConversation((resumePrefix && resumePrefix.length) ? resumePrefix.concat(rawFromMessages(nativeMsgs)) : nativeMsgs);
               if (settings.autoInject) {
                 const block = await M.compose(lastUserText(payload));
                 const sysStr = JSON.stringify(payload.system || "");
@@ -384,7 +399,7 @@
     wirePanel();
     ["cm-extbar", "cm-extlock", "cm-extglow"].forEach((id) => { const e = shadow.getElementById(id); if (e) e.remove(); });
     ensureExternalUI();
-    ["cm-topbtn", "cm-topbtn-plug", "cm-topbtn-hist"].forEach((id) => { const e = document.getElementById(id); if (e) e.remove(); });
+    ["cm-topbtn", "cm-topbtn-plug", "cm-topbtn-hist", "cm-topbtn-cap"].forEach((id) => { const e = document.getElementById(id); if (e) e.remove(); });
     mountTopButtons();
     updateResumeBanner();
     showScreen("list"); refreshList(); refreshConnect(); pollExternal();
@@ -479,6 +494,16 @@
     while (arr.length && arr[0].role !== "user") arr = arr.slice(1);
     return arr;
   }
+  // Carimba um ts por mensagem: casa por CHAVE (role + começo do conteúdo) com o que já estava
+  // salvo → mensagens que já existiam preservam seu ts; as NOVAS ganham "agora". Robusto a append
+  // (chave nova = agora) e ao capRaw que corta pela frente (chave sumida é ignorada). Serve pro
+  // modelo ver o timeline (inline na retomada) e pra UI (separador por dia + horário por card).
+  function msgKey(m) { return m.role + "|" + String(m.content == null ? "" : (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).slice(0, 100); }
+  function stampTimes(newMsgs, oldMsgs, now) {
+    const map = {};
+    for (const m of (oldMsgs || [])) if (m && m.ts != null) map[msgKey(m)] = m.ts;
+    return newMsgs.map((m) => { const k = msgKey(m); return { role: m.role, content: m.content, ts: (map[k] != null ? map[k] : now) }; });
+  }
 
   function handleOutgoing(payload) {
     const native = payload.messages || [];
@@ -516,7 +541,7 @@
   // Continuação: converte as mensagens cruas em TEXTO (com 🔧 ações e ↳ observações
   // da página — a inteligência) e prepend, respeitando um orçamento de contexto.
   function buildResumed(prefix, native) {
-    let pre = collapseRoles(prefix.map((m) => ({ role: m.role, content: msgText(m) })).filter((m) => m.content && m.content.trim()));
+    let pre = collapseRoles(prefix.map((m) => ({ role: m.role, content: (m.ts ? "[" + new Date(m.ts).toLocaleString() + "] " : "") + msgText(m) })).filter((m) => m.content && m.content.trim()));
     pre = trimByBudget(pre, 16000);
     while (pre.length && pre[0].role !== "user") pre.shift();
     while (pre.length && pre[pre.length - 1].role === "user") pre.pop();
@@ -529,6 +554,7 @@
   let pendingMsgs = null, pendingId = null, commitTimer = null;
   function recordConversation(messages) {
     try {
+      if (!settings.autoCapture) return; // toggle do cabeçalho: OFF = não grava histórico (nem captura marcador, gated em scanForMarkers)
       if (!Array.isArray(messages) || !messages.length) return;
       const raw = rawFromMessages(messages);
       if (!raw.some((m) => m.role === "user")) return;
@@ -546,8 +572,8 @@
       let list = (await chrome.storage.local.get(CONV_KEY))[CONV_KEY] || [];
       let conv = list.find((c) => c.id === id);
       const capped = capRaw(msgs);
-      if (!conv) { conv = { id, title: convTitle(capped), startedAt: now, updatedAt: now, messages: capped }; list.push(conv); }
-      else { if (msgs.length >= conv.messages.length) conv.messages = capped; conv.updatedAt = now; }
+      if (!conv) { conv = { id, title: convTitle(capped), startedAt: now, updatedAt: now, messages: stampTimes(capped, [], now) }; list.push(conv); }
+      else { if (msgs.length >= conv.messages.length) conv.messages = stampTimes(capped, conv.messages, now); conv.updatedAt = now; }
       list.sort((a, b) => b.updatedAt - a.updatedAt);
       if (list.length > 40) list = list.slice(0, 40);
       await chrome.storage.local.set({ [CONV_KEY]: list });
@@ -579,9 +605,39 @@
     const strong = h("strong", { textContent: (resumeConv.title || "").slice(0, 42) });
     const close = h("button", { className: "cm-resume-x", title: t("stop_continue") });
     close.innerHTML = ico("x", 14);
-    close.addEventListener("click", cancelResume);
-    bar.appendChild(label); bar.appendChild(strong); bar.appendChild(close);
+    const exp = h("button", { className: "cm-resume-exp", title: t("view_history") });
+    exp.innerHTML = ico("history", 14);
+    const top = h("div", { className: "cm-resume-top" });
+    top.appendChild(label); top.appendChild(strong); top.appendChild(exp); top.appendChild(close);
+    const tr = h("div", { className: "cm-resume-tr" });
+    tr.style.display = "none";
+    renderTranscript(tr, resumeConv.messages);
+    bar.appendChild(top); bar.appendChild(tr);
     bar.style.display = "flex";
+
+    // Ver histórico da conversa retomada (bolhas nossas, com data/hora) — Fase 2/3/4B.
+    let expanded = false;
+    exp.addEventListener("click", () => {
+      expanded = !expanded;
+      tr.style.display = expanded ? "flex" : "none"; // flex preserva gap/align do .cm-resume-tr
+      exp.classList.toggle("on", expanded);
+      if (expanded) tr.scrollTop = tr.scrollHeight;
+    });
+    // Fechar exige 2 cliques: 1º arma a confirmação (✓ + aviso), 2º encerra e inicia nova conversa.
+    let confirming = false, cTimer = null;
+    close.addEventListener("click", () => {
+      if (!confirming) {
+        confirming = true;
+        close.innerHTML = ico("check", 14); close.classList.add("confirm"); close.title = t("confirm_close");
+        toast(t("confirm_close"));
+        cTimer = setTimeout(() => { confirming = false; try { close.innerHTML = ico("x", 14); close.classList.remove("confirm"); close.title = t("stop_continue"); } catch (_) {} }, 3500);
+        return;
+      }
+      clearTimeout(cTimer);
+      cancelResume();
+      const el = getComposer(); if (el) { try { el.focus(); } catch (_) {} }
+      toast(t("new_conversation"));
+    });
   }
   async function getConversations() {
     try { return (await chrome.storage.local.get(CONV_KEY))[CONV_KEY] || []; } catch (_) { return []; }
@@ -664,20 +720,39 @@
       box.appendChild(card);
     }
   }
+  function sameDay(a, b) { return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate(); }
+  function dayLabel(ts) {
+    const d = new Date(ts), now = new Date(), yst = new Date(now.getTime() - 86400000);
+    if (sameDay(d, now)) return t("today");
+    if (sameDay(d, yst)) return t("yesterday");
+    return d.toLocaleDateString();
+  }
+  function hhmm(ts) { try { return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); } catch (_) { return ""; } }
+  // Render de transcript: bolhas + separador por DIA (estilo WhatsApp, quando cruza a meia-noite)
+  // + horário por card. Usado no histórico (openConv) e na overlay de retomada. 100% Shadow DOM nosso.
+  function renderTranscript(container, messages) {
+    container.innerHTML = "";
+    let lastDay = "";
+    for (const m of messages || []) {
+      const txt = msgText(m);
+      if (!txt) continue;
+      if (m.ts != null) {
+        const dk = new Date(m.ts).toDateString();
+        if (dk !== lastDay) { lastDay = dk; container.appendChild(h("div", { className: "cm-day-sep", textContent: dayLabel(m.ts) })); }
+      }
+      const row = h("div", { className: "cm-msg " + (m.role === "user" ? "user" : "asst") });
+      const role = h("div", { className: "cm-msg-role" });
+      role.textContent = (m.role === "user" ? t("you") : t("claude")) + (m.ts != null ? " · " + hhmm(m.ts) : "");
+      row.appendChild(role);
+      row.appendChild(h("div", { className: "cm-msg-text", textContent: txt }));
+      container.appendChild(row);
+    }
+  }
   async function openConv(id) {
     const list = await getConversations();
     currentConv = list.find((c) => c.id === id);
     if (!currentConv) return;
-    const tr = $("#cm-conv-transcript");
-    tr.innerHTML = "";
-    for (const m of currentConv.messages || []) {
-      const txt = msgText(m);
-      if (!txt) continue;
-      const row = h("div", { className: "cm-msg " + (m.role === "user" ? "user" : "asst") });
-      row.appendChild(h("div", { className: "cm-msg-role", textContent: m.role === "user" ? t("you") : t("claude") }));
-      row.appendChild(h("div", { className: "cm-msg-text", textContent: txt }));
-      tr.appendChild(row);
-    }
+    renderTranscript($("#cm-conv-transcript"), currentConv.messages);
     showScreen("conv");
   }
 
@@ -992,9 +1067,25 @@
     const plugBtn = mk("cm-topbtn-plug", "plug", "Claudão² — " + t("integration"), () => openPanel("connect"));
     const histBtn = mk("cm-topbtn-hist", "history", "Claudão² — " + t("history"), () => openPanel("history"));
     const memBtn = mk("cm-topbtn", "brain", "Claudão² — " + t("memory"), () => openPanel("list"));
+    const capBtn = mk("cm-topbtn-cap", "save", "", () => {
+      const v = !settings.autoCapture; settings.autoCapture = v;
+      M.setSetting("autoCapture", v);
+      toast(v ? t("t_capture_on") : t("t_capture_off"), v);
+      restyleCaptureBtn();
+    });
     anchor.parentElement.insertBefore(plugBtn, anchor);
     anchor.parentElement.insertBefore(histBtn, plugBtn);
     anchor.parentElement.insertBefore(memBtn, histBtn);
+    anchor.parentElement.insertBefore(capBtn, memBtn);
+    restyleCaptureBtn();
+  }
+  // Reflete o estado do toggle de captura no botão do cabeçalho (cor/opacidade/tooltip).
+  function restyleCaptureBtn() {
+    const b = document.getElementById("cm-topbtn-cap"); if (!b) return;
+    const on = !!settings.autoCapture;
+    b.style.color = on ? BRAND_ORANGE : "#9a958c";
+    b.style.opacity = on ? ".92" : ".5";
+    b.title = "Claudão² — " + (on ? t("capture_on_title") : t("capture_off_title"));
   }
   function syncFabVisibility() {
     const fab = shadow && shadow.getElementById("fab");
@@ -1699,14 +1790,22 @@
     #cm-extlock span { display: inline-flex; align-items: center; gap: 7px; background: var(--head); color: #ffb4b4;
       border: 1px solid #7a1f1f; border-radius: 999px; padding: 7px 14px; font-family: system-ui, sans-serif; font-size: 12px; }
 
-    #cm-resumebar { position: fixed; top: 0; left: 0; right: 0; z-index: 43; padding: 8px 12px;
+    #cm-resumebar { position: fixed; top: 0; left: 0; right: 0; z-index: 43;
       background: var(--accent); color: #fff; font-family: system-ui, sans-serif; font-size: 12px;
-      display: flex; align-items: center; justify-content: center; gap: 5px; box-shadow: 0 2px 12px rgba(0,0,0,.35); }
-    #cm-resumebar strong { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55%; }
+      display: flex; flex-direction: column; box-shadow: 0 2px 12px rgba(0,0,0,.35); }
+    #cm-resumebar .cm-resume-top { display: flex; align-items: center; justify-content: center; gap: 5px; padding: 8px 12px; }
+    #cm-resumebar strong { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
     #cm-resumebar .cm-resume-label { display: inline-flex; align-items: center; gap: 5px; opacity: .95; white-space: nowrap; }
-    #cm-resumebar .cm-resume-x { background: rgba(255,255,255,.18); border: none; color: #fff; border-radius: 6px;
-      padding: 3px; margin-left: 8px; cursor: pointer; display: inline-flex; }
-    #cm-resumebar .cm-resume-x:hover { background: rgba(255,255,255,.32); }
+    #cm-resumebar .cm-resume-exp, #cm-resumebar .cm-resume-x { background: rgba(255,255,255,.18); border: none; color: #fff; border-radius: 6px;
+      padding: 3px; cursor: pointer; display: inline-flex; }
+    #cm-resumebar .cm-resume-exp { margin-left: 8px; }
+    #cm-resumebar .cm-resume-x { margin-left: 4px; }
+    #cm-resumebar .cm-resume-exp:hover, #cm-resumebar .cm-resume-x:hover { background: rgba(255,255,255,.32); }
+    #cm-resumebar .cm-resume-exp.on { background: rgba(255,255,255,.4); }
+    #cm-resumebar .cm-resume-x.confirm { background: #fff; color: var(--accent); }
+    #cm-resumebar .cm-resume-tr { max-height: min(50vh, 340px); overflow-y: auto; background: var(--bg); color: var(--text);
+      padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; border-top: 1px solid rgba(255,255,255,.3); }
+    .cm-day-sep { align-self: center; font-size: 10.5px; color: var(--dim); background: var(--field); border-radius: 10px; padding: 2px 10px; margin: 2px 0; }
 
     #toast { position: fixed; bottom: 72px; right: 18px; max-width: 320px; background: var(--head); color: var(--text);
       padding: 10px 14px; border-radius: 8px; box-shadow: 0 6px 20px var(--shadow); font-family: system-ui, sans-serif; font-size: 12px;
