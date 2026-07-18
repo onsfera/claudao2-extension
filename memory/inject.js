@@ -168,7 +168,7 @@
       lang_label: "Idioma", lang_auto: "Automático", conversations: "Conversas", history: "Histórico de conversas",
       no_conversations: "Nenhuma conversa salva ainda.", msgs_count: "%n% mensagens", continue_conv: "Continuar esta conversa",
       conv_reopened: "Continuando esta conversa — é só escrever.", continuing: "Continuando", stop_continue: "Encerrar continuação", delete_conv_confirm: "Apagar esta conversa salva?",
-      view_history: "Ver histórico", confirm_close: "Clique de novo para fechar e iniciar uma conversa nova", new_conversation: "Nova conversa iniciada.", today: "Hoje", yesterday: "Ontem",
+      view_history: "Ver histórico", confirm_close: "Clique de novo para fechar e iniciar uma conversa nova", new_conversation: "Nova conversa iniciada.", today: "Hoje", yesterday: "Ontem", continue_here: "Continue escrevendo abaixo para seguir a conversa",
       conv_deleted: "Conversa apagada.", you: "Você", claude: "Claude", lang_changed: "Idioma alterado.",
       rename_conv: "Editar nome", delete_conv: "Excluir", rename_prompt: "Novo nome da conversa:", cancel: "Cancelar",
     },
@@ -176,7 +176,7 @@
       lang_label: "Language", lang_auto: "Automatic", conversations: "Conversations", history: "Conversation history",
       no_conversations: "No saved conversations yet.", msgs_count: "%n% messages", continue_conv: "Continue this conversation",
       conv_reopened: "Continuing this conversation — just type.", continuing: "Continuing", stop_continue: "Stop continuing", delete_conv_confirm: "Delete this saved conversation?",
-      view_history: "View history", confirm_close: "Click again to close and start a new conversation", new_conversation: "New conversation started.", today: "Today", yesterday: "Yesterday",
+      view_history: "View history", confirm_close: "Click again to close and start a new conversation", new_conversation: "New conversation started.", today: "Today", yesterday: "Yesterday", continue_here: "Keep typing below to continue the conversation",
       conv_deleted: "Conversation deleted.", you: "You", claude: "Claude", lang_changed: "Language changed.",
       rename_conv: "Rename", delete_conv: "Delete", rename_prompt: "New conversation name:", cancel: "Cancel",
     },
@@ -184,7 +184,7 @@
       lang_label: "Idioma", lang_auto: "Automático", conversations: "Conversaciones", history: "Historial de conversaciones",
       no_conversations: "Aún no hay conversaciones guardadas.", msgs_count: "%n% mensajes", continue_conv: "Continuar esta conversación",
       conv_reopened: "Continuando esta conversación — solo escribe.", continuing: "Continuando", stop_continue: "Terminar continuación", delete_conv_confirm: "¿Eliminar esta conversación guardada?",
-      view_history: "Ver historial", confirm_close: "Haz clic de nuevo para cerrar e iniciar una conversación nueva", new_conversation: "Nueva conversación iniciada.", today: "Hoy", yesterday: "Ayer",
+      view_history: "Ver historial", confirm_close: "Haz clic de nuevo para cerrar e iniciar una conversación nueva", new_conversation: "Nueva conversación iniciada.", today: "Hoy", yesterday: "Ayer", continue_here: "Sigue escribiendo abajo para continuar la conversación",
       conv_deleted: "Conversación eliminada.", you: "Tú", claude: "Claude", lang_changed: "Idioma cambiado.",
       rename_conv: "Editar nombre", delete_conv: "Eliminar", rename_prompt: "Nuevo nombre de la conversación:", cancel: "Cancelar",
     },
@@ -305,6 +305,7 @@
     if (!IS_SIDEPANEL) return;
     const orig = window.fetch;
     window.fetch = async function (input, init) {
+      let doTap = false; // vamos capturar o stream da resposta pra continuação visual ao vivo?
       try {
         const url = typeof input === "string" ? input : (input && input.url) || "";
         const method = ((init && init.method) || (input && input.method) || "GET").toUpperCase();
@@ -346,6 +347,13 @@
                   modified = true;
                 }
               }
+              // Continuação VISUAL ao vivo: se o overlay está montado, adiciona a mensagem do usuário
+              // e marca pra capturar o stream da resposta do assistant (só o TEXTO, ações filtradas).
+              if (resumeConv && resumeOv) {
+                const ut = extractUserText(lastUserText(payload));
+                if (ut && ut !== ovLastUser) { ovLastUser = ut; ovAppendUser(ut); } // nova mensagem do usuário (o loop de tools tem ut vazio)
+                doTap = true;
+              }
               if (modified) {
                 const newBody = JSON.stringify(payload);
                 if (init && typeof init.body === "string") init = { ...init, body: newBody };
@@ -355,10 +363,116 @@
           }
         }
       } catch (_) {}
-      return orig.call(this, input, init);
+      const res = await orig.call(this, input, init);
+      if (doTap) { try { tapResumeStream(res.clone()); } catch (_) {} } // clone: o app lê o original intacto
+      return res;
     };
   }
   patchFetch();
+
+  // ---------------------------------------------------------------------------
+  // Continuação VISUAL (Eixo B): overlay que ASSUME a área de mensagens do chat nativo e re-injeta
+  // a conversa como bolhas (só texto), com scroll natural. A conversa viva (nova msg + resposta do
+  // assistant ao vivo, via SSE) segue no mesmo fluxo — indistinguível de continuação real. Não toca
+  // no React nativo: overlay opaco por cima da lista (o composer sticky segue visível/interativo).
+  // ---------------------------------------------------------------------------
+  function ovBubble(role, text, ts) {
+    const wrap = h("div", { className: "cm-ov-msg " + (role === "user" ? "user" : "asst") });
+    wrap.appendChild(h("div", { className: "cm-ov-time", textContent: (role === "user" ? t("you") : t("claude")) + (ts ? " · " + hhmm(ts) : "") }));
+    const b = h("div", { className: "cm-ov-bubble", textContent: text || "" });
+    wrap.appendChild(b);
+    return { wrap, bubble: b };
+  }
+  function ovScroll() { if (resumeOv && ovPinned) resumeOv.scrollTop = resumeOv.scrollHeight; }
+  function ovMaybeDay(ts) { // separador por dia (estilo WhatsApp), inclusive entre histórico e ao vivo
+    if (!resumeOv || ts == null) return;
+    const dk = new Date(ts).toDateString();
+    if (dk !== ovLastDay) { ovLastDay = dk; resumeOv.appendChild(h("div", { className: "cm-ov-day", textContent: dayLabel(ts) })); }
+  }
+  function ovDropHint() { if (resumeOv) { const hn = resumeOv.querySelector(".cm-ov-hint"); if (hn) hn.remove(); } }
+  function renderChatBubbles(conv) {
+    if (!resumeOv) return;
+    resumeOv.innerHTML = ""; ovLastDay = "";
+    for (const m of (conv.messages || [])) {
+      const prose = m.role === "user" ? extractUserText(proseOnly(m.content)) : proseOnly(m.content);
+      if (!prose || !prose.trim()) continue; // SÓ o que foi escrito (ações/tool/memória ficam fora do visual)
+      ovMaybeDay(m.ts);
+      resumeOv.appendChild(ovBubble(m.role, prose.trim(), m.ts).wrap);
+    }
+    resumeOv.appendChild(h("div", { className: "cm-ov-hint", textContent: t("continue_here") }));
+  }
+  function positionResumeOverlay() {
+    if (!resumeOv) return;
+    const cont = document.querySelector("[data-autoscroll-container]");
+    if (!cont) { resumeOv.style.display = "none"; return; }
+    const cr = cont.getBoundingClientRect();
+    let bottom = cr.bottom;
+    const comp = getComposer();
+    if (comp) { const anchor = comp.closest('[class*="sticky"]') || comp; const compTop = anchor.getBoundingClientRect().top; if (compTop > cr.top + 20) bottom = compTop; }
+    if (cr.width < 40 || bottom - cr.top < 40) { resumeOv.style.display = "none"; return; }
+    resumeOv.style.display = "flex";
+    resumeOv.style.left = cr.left + "px";
+    resumeOv.style.top = cr.top + "px";
+    resumeOv.style.width = cr.width + "px";
+    resumeOv.style.height = (bottom - cr.top) + "px";
+  }
+  function mountResumeOverlay(conv) {
+    if (!shadow || !IS_SIDEPANEL) return;
+    unmountResumeOverlay();
+    resumeOv = h("div", { id: "cm-resume-overlay" });
+    resumeOv.addEventListener("scroll", () => { if (resumeOv) ovPinned = resumeOv.scrollHeight - resumeOv.scrollTop - resumeOv.clientHeight < 60; });
+    shadow.appendChild(resumeOv);
+    ovPinned = true; ovLastUser = "";
+    renderChatBubbles(conv);
+    positionResumeOverlay(); ovScroll();
+    const sync = () => positionResumeOverlay();
+    window.addEventListener("resize", sync, true);
+    window.addEventListener("scroll", sync, true);
+    let ro = null; try { ro = new ResizeObserver(sync); if (cont0()) ro.observe(cont0()); } catch (_) {}
+    const iv = setInterval(sync, 400); // âncora pode mudar de tamanho/posição (streaming, topbar)
+    resumeOvSync = () => { try { window.removeEventListener("resize", sync, true); window.removeEventListener("scroll", sync, true); if (ro) ro.disconnect(); clearInterval(iv); } catch (_) {} };
+  }
+  function cont0() { return document.querySelector("[data-autoscroll-container]"); }
+  function unmountResumeOverlay() {
+    if (resumeOvSync) { try { resumeOvSync(); } catch (_) {} resumeOvSync = null; }
+    if (resumeOv) { try { resumeOv.remove(); } catch (_) {} resumeOv = null; }
+    ovLastUser = "";
+  }
+  function ovAppendUser(text) {
+    if (!resumeOv || !text) return;
+    ovPinned = true; ovDropHint(); ovMaybeDay(Date.now());
+    resumeOv.appendChild(ovBubble("user", text, Date.now()).wrap);
+    ovScroll();
+  }
+  // Captura o stream SSE da resposta (clone; não consome o original que vai pro app). Renderiza só
+  // o TEXTO do assistant (content_block_delta/text_delta) numa bolha nova; ações/thinking são ignorados.
+  async function tapResumeStream(res) {
+    try {
+      if (!res || !res.body || !resumeOv) return;
+      const ct = (res.headers && res.headers.get && res.headers.get("content-type")) || "";
+      if (ct && ct.indexOf("text/event-stream") < 0) return;
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "", bubble = null;
+      const ensure = () => { if (!bubble && resumeOv) { ovPinned = true; ovDropHint(); ovMaybeDay(Date.now()); const b = ovBubble("assistant", "", Date.now()); resumeOv.appendChild(b.wrap); bubble = b.bubble; ovScroll(); } };
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).replace(/\r$/, ""); buf = buf.slice(nl + 1);
+          if (line.indexOf("data:") !== 0) continue;
+          const data = line.slice(5).trim();
+          if (!data) continue;
+          let ev; try { ev = JSON.parse(data); } catch (_) { continue; }
+          if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "text_delta") { ensure(); if (bubble) { bubble.textContent += ev.delta.text; ovScroll(); } }
+          else if (ev.type === "message_stop") return;
+        }
+        if (!resumeOv) return; // usuário fechou a continuação no meio do stream
+      }
+    } catch (_) {}
+  }
 
   // Responder do mundo MAIN (bridge-capture): nas abas do claude.ai o fetch é interceptado LÁ
   // (o mundo isolado não alcança o window.fetch da página); ele nos manda a query e devolvemos o
@@ -460,6 +574,8 @@
   // pertence à sessão ativa. Elimina a duplicação.
   let sessionConvId = null, sessionSaw = false, convSeq = 0;
   let resumePrefix = null, resumeConv = null;
+  // Overlay de continuação visual (Eixo B): re-injeta a conversa como bolhas na área de mensagens.
+  let resumeOv = null, resumeOvSync = null, ovPinned = true, ovLastUser = "", ovLastDay = "";
 
   // --- Guarda as mensagens CRUAS (preserva tool_use/tool_result = a inteligência
   //     que o agente gera ao interagir com a página). Imagens viram placeholder. ---
@@ -527,7 +643,7 @@
     const isFresh = cnt <= 1 && !hasAsst;
     if (isFresh && sessionSaw) {
       sessionConvId = null; sessionSaw = false;
-      if (resumeConv) { resumePrefix = null; resumeConv = null; updateResumeBanner(); }
+      if (resumeConv) { resumePrefix = null; resumeConv = null; unmountResumeOverlay(); updateResumeBanner(); } // conversa nova nativa: encerra a continuação (senão o overlay ficaria preso)
     }
     if (!sessionConvId) sessionConvId = "c" + Date.now() + "-" + (convSeq++);
     if (hasAsst || cnt > 1) sessionSaw = true;
@@ -588,7 +704,7 @@
   function convChunks(conv) {
     const out = [];
     for (const m of (conv.messages || [])) {
-      const prose = m.role === "user" ? extractUserText(contentText(m.content)) : proseOnly(m.content);
+      const prose = m.role === "user" ? extractUserText(proseOnly(m.content)) : proseOnly(m.content);
       if (prose && prose.trim()) out.push({ role: m.role, ts: m.ts, text: prose.trim(), hidden: false });
       for (const a of actionsOnly(m.content)) out.push({ role: "tool", ts: m.ts, text: a, hidden: true });
     }
@@ -597,7 +713,7 @@
   function convIndex(conv) {
     const lines = [];
     for (const m of (conv.messages || [])) {
-      const prose = m.role === "user" ? extractUserText(contentText(m.content)) : proseOnly(m.content);
+      const prose = m.role === "user" ? extractUserText(proseOnly(m.content)) : proseOnly(m.content);
       const hasAction = Array.isArray(m.content) && m.content.some((b) => b && b.type === "tool_use");
       const snippet = (prose || "").replace(/\s+/g, " ").slice(0, 80);
       if (!snippet && !hasAction) continue;
@@ -661,14 +777,16 @@
   // --- Continuação de conversa (reabrir) ---
   function startResume(conv) {
     resumeConv = conv;
-    resumePrefix = conv.messages || [];   // mensagens cruas (com ferramentas)
+    resumePrefix = conv.messages || [];   // mensagens cruas (com ferramentas) — pro RAG e recording
     sessionConvId = conv.id;
     sessionSaw = false;
-    updateResumeBanner();
+    mountResumeOverlay(conv);              // continuação VISUAL: a conversa reaparece como bolhas
+    updateResumeBanner();                 // depois do overlay: o banner suprime o "ver histórico" redundante
     const el = getComposer(); if (el) el.focus();
   }
   function cancelResume() {
     resumePrefix = null; resumeConv = null; sessionConvId = null; sessionSaw = false;
+    unmountResumeOverlay();
     updateResumeBanner();
   }
   function updateResumeBanner() {
@@ -682,24 +800,27 @@
     const strong = h("strong", { textContent: (resumeConv.title || "").slice(0, 42) });
     const close = h("button", { className: "cm-resume-x", title: t("stop_continue") });
     close.innerHTML = ico("x", 14);
-    const exp = h("button", { className: "cm-resume-exp", title: t("view_history") });
-    exp.innerHTML = ico("history", 14);
     const top = h("div", { className: "cm-resume-top" });
-    top.appendChild(label); top.appendChild(strong); top.appendChild(exp); top.appendChild(close);
-    const tr = h("div", { className: "cm-resume-tr" });
-    tr.style.display = "none";
-    renderTranscript(tr, resumeConv.messages);
-    bar.appendChild(top); bar.appendChild(tr);
+    top.appendChild(label); top.appendChild(strong);
+    // O overlay (Eixo B) já mostra a conversa inteira e ao vivo; o "ver histórico" expansível do
+    // banner só entra como FALLBACK quando o overlay NÃO está ativo (evita a mesma conversa 2x).
+    let exp = null, tr = null;
+    if (!resumeOv) {
+      exp = h("button", { className: "cm-resume-exp", title: t("view_history") });
+      exp.innerHTML = ico("history", 14);
+      top.appendChild(exp);
+      tr = h("div", { className: "cm-resume-tr" });
+      tr.style.display = "none";
+      renderTranscript(tr, resumeConv.messages);
+    }
+    top.appendChild(close);
+    bar.appendChild(top); if (tr) bar.appendChild(tr);
     bar.style.display = "flex";
 
-    // Ver histórico da conversa retomada (bolhas nossas, com data/hora) — Fase 2/3/4B.
-    let expanded = false;
-    exp.addEventListener("click", () => {
-      expanded = !expanded;
-      tr.style.display = expanded ? "flex" : "none"; // flex preserva gap/align do .cm-resume-tr
-      exp.classList.toggle("on", expanded);
-      if (expanded) tr.scrollTop = tr.scrollHeight;
-    });
+    if (exp && tr) {
+      let expanded = false;
+      exp.addEventListener("click", () => { expanded = !expanded; tr.style.display = expanded ? "flex" : "none"; exp.classList.toggle("on", expanded); if (expanded) tr.scrollTop = tr.scrollHeight; });
+    }
     // Fechar exige 2 cliques: 1º arma a confirmação (✓ + aviso), 2º encerra e inicia nova conversa.
     let confirming = false, cTimer = null;
     close.addEventListener("click", () => {
@@ -1716,12 +1837,12 @@
     * { box-sizing: border-box; }
     .lucide { flex: none; vertical-align: middle; }
 
-    #fab { position: fixed; bottom: 18px; right: 18px; width: 44px; height: 44px; border-radius: 50%;
+    #fab { position: fixed; bottom: 18px; right: 18px; width: 44px; height: 44px; border-radius: 50%; z-index: 46;
       border: none; cursor: pointer; background: var(--accent); color: #fff;
       box-shadow: 0 4px 14px rgba(0,0,0,.28); display: flex; align-items: center; justify-content: center; }
     #fab:hover { filter: brightness(1.08); }
 
-    #panel { background: var(--bg); color: var(--text); flex-direction: column; overflow: hidden;
+    #panel { background: var(--bg); color: var(--text); flex-direction: column; overflow: hidden; z-index: 50;
       font-family: system-ui, -apple-system, sans-serif; font-size: 13px; }
     #panel.popup { position: fixed; bottom: 72px; right: 18px; width: 380px; max-height: 80vh;
       border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 12px 40px var(--shadow); }
@@ -1883,6 +2004,18 @@
     #cm-resumebar .cm-resume-tr { max-height: min(50vh, 340px); overflow-y: auto; background: var(--bg); color: var(--text);
       padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; border-top: 1px solid rgba(255,255,255,.3); }
     .cm-day-sep { align-self: center; font-size: 10.5px; color: var(--dim); background: var(--field); border-radius: 10px; padding: 2px 10px; margin: 2px 0; }
+    /* Overlay de continuação visual (Eixo B): cobre a área de mensagens, bolhas estilo chat, scroll natural. */
+    #cm-resume-overlay { position: fixed; z-index: 20; background: var(--bg); color: var(--text); overflow-y: auto; overscroll-behavior: contain;
+      display: flex; flex-direction: column; gap: 14px; padding: 16px 14px 22px; box-sizing: border-box; }
+    #cm-resume-overlay .cm-ov-msg { max-width: 88%; display: flex; flex-direction: column; gap: 3px; }
+    #cm-resume-overlay .cm-ov-msg.user { align-self: flex-end; align-items: flex-end; }
+    #cm-resume-overlay .cm-ov-msg.asst { align-self: flex-start; }
+    #cm-resume-overlay .cm-ov-time { font-size: 10px; color: var(--dim); padding: 0 2px; }
+    #cm-resume-overlay .cm-ov-bubble { font: 13.5px/1.55 system-ui, -apple-system, sans-serif; white-space: pre-wrap; word-break: break-word; border-radius: 14px; padding: 9px 13px; }
+    #cm-resume-overlay .cm-ov-msg.user .cm-ov-bubble { background: var(--field); }
+    #cm-resume-overlay .cm-ov-msg.asst .cm-ov-bubble { background: transparent; padding: 2px 0; }
+    #cm-resume-overlay .cm-ov-day { align-self: center; font-size: 10.5px; color: var(--dim); background: var(--field); border-radius: 10px; padding: 3px 11px; }
+    #cm-resume-overlay .cm-ov-hint { align-self: center; font-size: 11px; color: var(--dim); padding: 6px 4px 2px; opacity: .8; }
 
     #toast { position: fixed; bottom: 72px; right: 18px; max-width: 320px; background: var(--head); color: var(--text);
       padding: 10px 14px; border-radius: 8px; box-shadow: 0 6px 20px var(--shadow); font-family: system-ui, sans-serif; font-size: 12px;
