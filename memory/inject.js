@@ -168,7 +168,7 @@
       lang_label: "Idioma", lang_auto: "Automático", conversations: "Conversas", history: "Histórico de conversas",
       no_conversations: "Nenhuma conversa salva ainda.", msgs_count: "%n% mensagens", continue_conv: "Continuar esta conversa",
       conv_reopened: "Continuando esta conversa — é só escrever.", continuing: "Continuando", stop_continue: "Encerrar continuação", delete_conv_confirm: "Apagar esta conversa salva?",
-      view_history: "Ver histórico", confirm_close: "Clique de novo para fechar e iniciar uma conversa nova", new_conversation: "Nova conversa iniciada.", today: "Hoje", yesterday: "Ontem", continue_here: "Continue escrevendo abaixo para seguir a conversa",
+      view_history: "Ver histórico", confirm_close: "Clique de novo para fechar e iniciar uma conversa nova", new_conversation: "Nova conversa iniciada.", today: "Hoje", yesterday: "Ontem", continue_here: "Continue escrevendo abaixo para seguir a conversa", back_to_list: "Voltar à lista de conversas",
       conv_deleted: "Conversa apagada.", you: "Você", claude: "Claude", lang_changed: "Idioma alterado.",
       rename_conv: "Editar nome", delete_conv: "Excluir", rename_prompt: "Novo nome da conversa:", cancel: "Cancelar",
     },
@@ -176,7 +176,7 @@
       lang_label: "Language", lang_auto: "Automatic", conversations: "Conversations", history: "Conversation history",
       no_conversations: "No saved conversations yet.", msgs_count: "%n% messages", continue_conv: "Continue this conversation",
       conv_reopened: "Continuing this conversation — just type.", continuing: "Continuing", stop_continue: "Stop continuing", delete_conv_confirm: "Delete this saved conversation?",
-      view_history: "View history", confirm_close: "Click again to close and start a new conversation", new_conversation: "New conversation started.", today: "Today", yesterday: "Yesterday", continue_here: "Keep typing below to continue the conversation",
+      view_history: "View history", confirm_close: "Click again to close and start a new conversation", new_conversation: "New conversation started.", today: "Today", yesterday: "Yesterday", continue_here: "Keep typing below to continue the conversation", back_to_list: "Back to conversation list",
       conv_deleted: "Conversation deleted.", you: "You", claude: "Claude", lang_changed: "Language changed.",
       rename_conv: "Rename", delete_conv: "Delete", rename_prompt: "New conversation name:", cancel: "Cancel",
     },
@@ -184,7 +184,7 @@
       lang_label: "Idioma", lang_auto: "Automático", conversations: "Conversaciones", history: "Historial de conversaciones",
       no_conversations: "Aún no hay conversaciones guardadas.", msgs_count: "%n% mensajes", continue_conv: "Continuar esta conversación",
       conv_reopened: "Continuando esta conversación — solo escribe.", continuing: "Continuando", stop_continue: "Terminar continuación", delete_conv_confirm: "¿Eliminar esta conversación guardada?",
-      view_history: "Ver historial", confirm_close: "Haz clic de nuevo para cerrar e iniciar una conversación nueva", new_conversation: "Nueva conversación iniciada.", today: "Hoy", yesterday: "Ayer", continue_here: "Sigue escribiendo abajo para continuar la conversación",
+      view_history: "Ver historial", confirm_close: "Haz clic de nuevo para cerrar e iniciar una conversación nueva", new_conversation: "Nueva conversación iniciada.", today: "Hoy", yesterday: "Ayer", continue_here: "Sigue escribiendo abajo para continuar la conversación", back_to_list: "Volver a la lista de conversaciones",
       conv_deleted: "Conversación eliminada.", you: "Tú", claude: "Claude", lang_changed: "Idioma cambiado.",
       rename_conv: "Editar nombre", delete_conv: "Eliminar", rename_prompt: "Nuevo nombre de la conversación:", cancel: "Cancelar",
     },
@@ -378,6 +378,7 @@
   // ---------------------------------------------------------------------------
   function ovBubble(role, text, ts) {
     const wrap = h("div", { className: "cm-ov-msg " + (role === "user" ? "user" : "asst") });
+    if (ts) wrap.dataset.day = dayLabel(ts); // usado pelo header de data flutuante ao rolar
     wrap.appendChild(h("div", { className: "cm-ov-time", textContent: (role === "user" ? t("you") : t("claude")) + (ts ? " · " + hhmm(ts) : "") }));
     const b = h("div", { className: "cm-ov-bubble", textContent: text || "" });
     wrap.appendChild(b);
@@ -390,9 +391,23 @@
     if (dk !== ovLastDay) { ovLastDay = dk; resumeOv.appendChild(h("div", { className: "cm-ov-day", textContent: dayLabel(ts) })); }
   }
   function ovDropHint() { if (resumeOv) { const hn = resumeOv.querySelector(".cm-ov-hint"); if (hn) hn.remove(); } }
+  // Header de data FLUTUANTE (estilo WhatsApp): mostra o dia da mensagem no topo da viewport ao rolar,
+  // e some sozinho depois. Complementa o separador inline (cm-ov-day) que divide os dias.
+  let ovHdrTimer = null;
+  function ovUpdateDateHdr() {
+    if (!resumeOv) return;
+    const hdr = resumeOv.querySelector(".cm-ov-datehdr"); if (!hdr) return;
+    const top = resumeOv.scrollTop;
+    let day = "";
+    const bubbles = resumeOv.querySelectorAll(".cm-ov-msg");
+    for (const b of bubbles) { if (b.offsetTop + b.offsetHeight > top + 6) { day = (b.dataset && b.dataset.day) || ""; break; } }
+    if (day) { hdr.textContent = day; hdr.classList.add("show"); }
+    clearTimeout(ovHdrTimer); ovHdrTimer = setTimeout(() => { const h2 = resumeOv && resumeOv.querySelector(".cm-ov-datehdr"); if (h2) h2.classList.remove("show"); }, 1500);
+  }
   function renderChatBubbles(conv) {
     if (!resumeOv) return;
     resumeOv.innerHTML = ""; ovLastDay = "";
+    resumeOv.appendChild(h("div", { className: "cm-ov-datehdr" })); // pill flutuante de data (aparece ao rolar)
     for (const m of (conv.messages || [])) {
       const prose = m.role === "user" ? extractUserText(proseOnly(m.content)) : proseOnly(m.content);
       if (!prose || !prose.trim()) continue; // SÓ o que foi escrito (ações/tool/memória ficam fora do visual)
@@ -420,7 +435,7 @@
     if (!shadow || !IS_SIDEPANEL) return;
     unmountResumeOverlay();
     resumeOv = h("div", { id: "cm-resume-overlay" });
-    resumeOv.addEventListener("scroll", () => { if (resumeOv) ovPinned = resumeOv.scrollHeight - resumeOv.scrollTop - resumeOv.clientHeight < 60; });
+    resumeOv.addEventListener("scroll", () => { if (resumeOv) { ovPinned = resumeOv.scrollHeight - resumeOv.scrollTop - resumeOv.clientHeight < 60; ovUpdateDateHdr(); } });
     shadow.appendChild(resumeOv);
     ovPinned = true; ovLastUser = "";
     renderChatBubbles(conv);
@@ -789,6 +804,27 @@
     unmountResumeOverlay();
     updateResumeBanner();
   }
+  // Editar o nome da conversa direto no banner (troca o título por um input inline).
+  async function bannerRename(strongEl, conv) {
+    if (!strongEl || !conv) return;
+    const input = h("input", { className: "cm-resume-rename", type: "text", value: conv.title || "" });
+    try { strongEl.replaceWith(input); input.focus(); input.select(); } catch (_) { return; }
+    let done = false;
+    const finish = async (save) => {
+      if (done) return; done = true;
+      if (save) {
+        const name = input.value.trim();
+        if (name) {
+          conv.title = name.slice(0, 90);
+          try { const list = await getConversations(); const cv = list.find((x) => x.id === conv.id); if (cv) { cv.title = conv.title; await chrome.storage.local.set({ [CONV_KEY]: list }); } } catch (_) {}
+          if (curScreen === "history") refreshHistory();
+        }
+      }
+      updateResumeBanner();
+    };
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); finish(true); } else if (e.key === "Escape") finish(false); });
+    input.addEventListener("blur", () => finish(true));
+  }
   function updateResumeBanner() {
     if (!shadow) return;
     let bar = shadow.getElementById("cm-resumebar");
@@ -797,11 +833,17 @@
     bar.innerHTML = "";
     const label = h("span", { className: "cm-resume-label" });
     label.innerHTML = ico("messages-square", 13) + " " + t("continuing") + ": ";
-    const strong = h("strong", { textContent: (resumeConv.title || "").slice(0, 42) });
+    const strong = h("strong", { textContent: (resumeConv.title || "").slice(0, 42), title: resumeConv.title || "" }); // tooltip = nome completo
     const close = h("button", { className: "cm-resume-x", title: t("stop_continue") });
     close.innerHTML = ico("x", 14);
+    const back = h("button", { className: "cm-resume-exp", title: t("back_to_list") }); // voltar à lista de conversas
+    back.innerHTML = ico("arrow-left", 14);
+    back.addEventListener("click", () => openPanel("history"));
+    const edit = h("button", { className: "cm-resume-exp", title: t("rename_conv") });
+    edit.innerHTML = ico("pencil", 13);
+    edit.addEventListener("click", () => bannerRename(strong, resumeConv));
     const top = h("div", { className: "cm-resume-top" });
-    top.appendChild(label); top.appendChild(strong);
+    top.appendChild(back); top.appendChild(label); top.appendChild(strong); top.appendChild(edit);
     // O overlay (Eixo B) já mostra a conversa inteira e ao vivo; o "ver histórico" expansível do
     // banner só entra como FALLBACK quando o overlay NÃO está ativo (evita a mesma conversa 2x).
     let exp = null, tr = null;
@@ -855,7 +897,8 @@
     menuBtn.innerHTML = ico("more-vertical", 16);
     menuBtn.addEventListener("click", (ev) => { ev.stopPropagation(); toggleConvMenu(card, c); });
     card.appendChild(icon); card.appendChild(mid); card.appendChild(menuBtn);
-    card.onclick = () => { closeConvMenus(); openConv(c.id); };
+    // Clicar no card RETOMA direto (sem a tela intermediária de transcript). Rename/excluir seguem no menu ⋮.
+    card.onclick = () => { closeConvMenus(); startResume(c); togglePanel(); toast(t("conv_reopened")); };
   }
   function toggleConvMenu(card, c) {
     const existing = card.querySelector(".cm-conv-menu");
@@ -2016,6 +2059,10 @@
     #cm-resume-overlay .cm-ov-msg.asst .cm-ov-bubble { background: transparent; padding: 2px 0; }
     #cm-resume-overlay .cm-ov-day { align-self: center; font-size: 10.5px; color: var(--dim); background: var(--field); border-radius: 10px; padding: 3px 11px; }
     #cm-resume-overlay .cm-ov-hint { align-self: center; font-size: 11px; color: var(--dim); padding: 6px 4px 2px; opacity: .8; }
+    #cm-resume-overlay .cm-ov-datehdr { position: sticky; top: 6px; align-self: center; z-index: 3; margin-bottom: -26px; opacity: 0; transition: opacity .25s; pointer-events: none;
+      font-size: 10.5px; color: var(--dim); background: var(--field); border-radius: 11px; padding: 3px 12px; box-shadow: 0 1px 7px rgba(0,0,0,.22); }
+    #cm-resume-overlay .cm-ov-datehdr.show { opacity: 1; }
+    #cm-resumebar .cm-resume-rename { font: 600 12px system-ui, sans-serif; color: #fff; background: rgba(255,255,255,.2); border: 1px solid rgba(255,255,255,.45); border-radius: 6px; padding: 2px 7px; max-width: 52%; outline: none; }
 
     #toast { position: fixed; bottom: 72px; right: 18px; max-width: 320px; background: var(--head); color: var(--text);
       padding: 10px 14px; border-radius: 8px; box-shadow: 0 6px 20px var(--shadow); font-family: system-ui, sans-serif; font-size: 12px;
