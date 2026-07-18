@@ -288,6 +288,7 @@
   // Injeção REAL da memória (sidepanel): patch no fetch para /v1/messages
   // ---------------------------------------------------------------------------
   const MEM_TAG = "=== MEMÓRIA PERSISTENTE DO CLAUDE";
+  const RESUME_TAG = "=== CONVERSA RETOMADA";
   function lastUserText(payload) {
     try {
       const msgs = payload.messages || [];
@@ -329,6 +330,19 @@
                   if (Array.isArray(payload.system)) payload.system.push({ type: "text", text: block });
                   else if (typeof payload.system === "string" && payload.system) payload.system = payload.system + "\n\n" + block;
                   else payload.system = block;
+                  modified = true;
+                }
+              }
+              // Continuação = RAG INTERNO sobre a conversa retomada (não dump). Injeta no `system`:
+              // nota + índice + top-K trechos relevantes à mensagem atual (ações ficam ocultas, só
+              // emergem se casarem). Independente do autoInject (que governa a memória, não a retomada).
+              if (resumePrefix && resumePrefix.length && resumeConv) {
+                const rblock = resumeRagBlock(resumeConv, lastUserText(payload));
+                const sysStr2 = JSON.stringify(payload.system || "");
+                if (rblock && !sysStr2.includes(RESUME_TAG)) {
+                  if (Array.isArray(payload.system)) payload.system.push({ type: "text", text: rblock });
+                  else if (typeof payload.system === "string" && payload.system) payload.system = payload.system + "\n\n" + rblock;
+                  else payload.system = rblock;
                   modified = true;
                 }
               }
@@ -517,7 +531,8 @@
     }
     if (!sessionConvId) sessionConvId = "c" + Date.now() + "-" + (convSeq++);
     if (hasAsst || cnt > 1) sessionSaw = true;
-    if (resumePrefix && resumePrefix.length) payload.messages = buildResumed(resumePrefix, native);
+    // A continuação NÃO despeja mais a conversa em payload.messages (dump). Ela entra como RAG no
+    // `system` (resumeRagBlock, no patchFetch). Aqui só mantemos a identidade de sessão. native intacto.
     return payload.messages;
   }
 
@@ -547,6 +562,68 @@
     while (pre.length && pre[pre.length - 1].role === "user") pre.pop();
     if (!pre.length) return native;
     return pre.concat(native);
+  }
+
+  // --- RAG INTERNO da conversa retomada (Eixo A): em vez de despejar tudo, o modelo recebe uma
+  //     nota + um índice do que rolou + os trechos relevantes à pergunta atual. Ações da página
+  //     (tool_use/result) entram como contexto OCULTO (indexável, só emerge se casar com a query). ---
+  function proseOnly(content) {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content.filter((b) => b && (b.type === "text" || typeof b.text === "string")).map((b) => b.text || "").join("\n").trim();
+  }
+  function actionsOnly(content) {
+    if (!Array.isArray(content)) return [];
+    const acts = [];
+    for (const b of content) {
+      if (!b) continue;
+      if (b.type === "tool_use") acts.push("🔧 " + (b.name || "ação") + (b.input ? " " + JSON.stringify(b.input).slice(0, 200) : ""));
+      else if (b.type === "tool_result") {
+        const inner = Array.isArray(b.content) ? b.content.filter((c) => c && (c.type === "text" || typeof c.text === "string")).map((c) => c.text || "").join(" ") : (typeof b.content === "string" ? b.content : "");
+        if (inner) acts.push("↳ " + inner.slice(0, 500));
+      }
+    }
+    return acts;
+  }
+  function convChunks(conv) {
+    const out = [];
+    for (const m of (conv.messages || [])) {
+      const prose = m.role === "user" ? extractUserText(contentText(m.content)) : proseOnly(m.content);
+      if (prose && prose.trim()) out.push({ role: m.role, ts: m.ts, text: prose.trim(), hidden: false });
+      for (const a of actionsOnly(m.content)) out.push({ role: "tool", ts: m.ts, text: a, hidden: true });
+    }
+    return out;
+  }
+  function convIndex(conv) {
+    const lines = [];
+    for (const m of (conv.messages || [])) {
+      const prose = m.role === "user" ? extractUserText(contentText(m.content)) : proseOnly(m.content);
+      const hasAction = Array.isArray(m.content) && m.content.some((b) => b && b.type === "tool_use");
+      const snippet = (prose || "").replace(/\s+/g, " ").slice(0, 80);
+      if (!snippet && !hasAction) continue;
+      const who = m.role === "user" ? t("you") : t("claude");
+      lines.push((lines.length + 1) + ". [" + who + (m.ts ? " · " + hhmm(m.ts) : "") + "] " + snippet + (hasAction ? "  🔧" : ""));
+      if (lines.length >= 60) break;
+    }
+    return lines.join("\n");
+  }
+  function resumeRagBlock(conv, query) {
+    const msgs = conv.messages || [];
+    if (!msgs.length) return "";
+    const chunks = convChunks(conv);
+    const top = (query && M.retrieveConversation) ? M.retrieveConversation(query, chunks, { maxChunks: 8, maxChars: 4000 }) : [];
+    const vis = top.filter((c) => !c.hidden), hid = top.filter((c) => c.hidden);
+    let firstTs = null, lastTs = null;
+    for (const m of msgs) { if (m.ts) { if (firstTs == null) firstTs = m.ts; lastTs = m.ts; } }
+    let range = "";
+    if (firstTs) { range = new Date(firstTs).toLocaleString(); if (lastTs && !sameDay(new Date(firstTs), new Date(lastTs))) range += " – " + new Date(lastTs).toLocaleString(); }
+    let s = RESUME_TAG + " (continuação) ===\n";
+    s += "Você está CONTINUANDO uma conversa" + (range ? " de " + range : "") + ", com " + msgs.length + " mensagens — NÃO é o começo. O histórico está indexado abaixo; se precisar de algo que não está nos trechos, é só pedir que eu trago.\n";
+    s += "--- índice (o que já rolou) ---\n" + convIndex(conv) + "\n";
+    if (vis.length) { s += "--- trechos relevantes à minha mensagem atual ---\n"; for (const c of vis) s += "[" + (c.role === "user" ? t("you") : t("claude")) + (c.ts ? " · " + hhmm(c.ts) : "") + "] " + (c.text || "").slice(0, 600) + "\n"; }
+    if (hid.length) { s += "--- ações/observações da página que casam ---\n"; for (const c of hid) s += (c.text || "").slice(0, 500) + "\n"; }
+    s += "=== FIM DA CONVERSA RETOMADA ===\n";
+    return s;
   }
 
   // Debounce: o agente dispara vários POSTs por turno; grava 1x o estado mais

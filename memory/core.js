@@ -386,6 +386,41 @@
       return out;
     },
 
+    /** RAG sobre as MENSAGENS de UMA conversa retomada. Recebe chunks já montados
+     *  ({role, ts, text, hidden}) e devolve os top-K relevantes à query, preservando os
+     *  metadados. Reusa as MESMAS primitivas (tokenize + fórmula de score + desempate por
+     *  recência) de retrieve(), sem depender de docs/pinned. */
+    retrieveConversation(query, chunks, opts = {}) {
+      const qTokens = tokenize(query);
+      if (!qTokens.length || !Array.isArray(chunks)) return [];
+      const qSet = new Set(qTokens);
+      const maxChunks = opts.maxChunks || 8;
+      const maxChars = opts.maxChars || 4000;
+      const scored = [];
+      let idx = 0;
+      for (const c of chunks) {
+        idx++;
+        const cTokens = tokenize(c.text || "");
+        if (!cTokens.length) continue;
+        const seen = new Set();
+        let overlap = 0;
+        for (const tk of cTokens) if (qSet.has(tk) && !seen.has(tk)) { overlap++; seen.add(tk); }
+        if (!overlap) continue;
+        const score = overlap / Math.sqrt(cTokens.length) + overlap * 0.15;
+        scored.push({ role: c.role, ts: c.ts, hidden: !!c.hidden, text: c.text, score, idx });
+      }
+      scored.sort((a, b) => b.score - a.score || b.idx - a.idx);
+      const out = [];
+      let chars = 0;
+      for (const s of scored) {
+        if (out.length >= maxChunks) break;
+        chars += (s.text || "").length;
+        if (chars > maxChars && out.length) break;
+        out.push(s);
+      }
+      return out;
+    },
+
     /** Monta o bloco injetado: núcleo fixo (sempre) + trechos recuperados por
      *  relevância à mensagem atual (query). Sem query, injeta só o núcleo. */
     async compose(query) {
