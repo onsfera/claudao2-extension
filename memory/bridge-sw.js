@@ -736,7 +736,6 @@
             return;
           }
           window.__claudaoGlowTs = Date.now(); // renova (mantém vivo)
-          window.__claudaoActUntil = Date.now() + 2000; // janela de "agindo agora" p/ o takeover
           if (!document.getElementById("__claudao_glow__")) {
             const d = document.createElement("div"); d.id = "__claudao_glow__";
             d.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483646;box-shadow:inset 0 0 0 3px rgba(255,64,64,.95), inset 0 0 42px rgba(255,64,64,.5);animation:__claudaoGlow 1.6s ease-in-out infinite;";
@@ -792,19 +791,23 @@
             tick(); // aplica de imediato (não espera o 1º intervalo)
             window.__claudaoTabInt = setInterval(tick, 120); // mesmo ritmo do spinner do Claude Code
           }
-          // auto-pausa: input REAL do usuário com glow ativo = "assumi o controle"
+          // Auto-pausa: 3 CLIQUES do usuário em 10s NESTA aba (e só com glow ativo = o Claude está/
+          // esteve agindo aqui) = "assumi o controle". NÃO pausa em clique único nem em tecla, e nunca
+          // em aba que o Claude não está tocando (sem glow = sem gate). O botão pausa direto.
           if (!window.__claudaoTakeoverBound) {
             window.__claudaoTakeoverBound = true;
-            const onUser = (ev) => {
+            window.__claudaoClicks = [];
+            const onClick = (ev) => {
               if (!ev.isTrusted) return;
-              if (ev.target && ev.target.id === "__claudao_stop__") return; // o botão já pausa
-              if (!document.getElementById("__claudao_glow__")) return;      // só com glow ativo
-              if (Date.now() > (window.__claudaoActUntil || 0)) return;      // só se o Claude agiu nos últimos ~2s
-              if (Date.now() < (window.__claudaoSelfClick || 0)) return;     // ignora o CLIQUE REAL do próprio Claude (CDP também é isTrusted)
-              try { chrome.runtime.sendMessage({ cm_pause: true, reason: "takeover" }); } catch (_) {}
+              if (ev.target && ev.target.id === "__claudao_stop__") return;  // o botão já pausa
+              if (!document.getElementById("__claudao_glow__")) return;       // só com glow ativo (Claude agindo NESTA aba)
+              if (Date.now() < (window.__claudaoSelfClick || 0)) return;      // ignora o clique REAL do próprio Claude (CDP também é isTrusted)
+              const now = Date.now(), cl = window.__claudaoClicks;
+              cl.push(now);
+              while (cl.length && now - cl[0] > 10000) cl.shift();            // janela deslizante de 10s
+              if (cl.length >= 3) { cl.length = 0; try { chrome.runtime.sendMessage({ cm_pause: true, reason: "takeover" }); } catch (_) {} }
             };
-            addEventListener("mousedown", onUser, true);
-            addEventListener("keydown", onUser, true);
+            addEventListener("mousedown", onClick, true);
           }
         },
         args: [!!on, client || "", GLOW_TTL_MS, PAGE_STR[uiLang]],
