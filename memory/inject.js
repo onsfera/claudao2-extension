@@ -71,7 +71,7 @@
       insert_all: "Inserir memória na conversa", save_selection: "Salvar seleção da página",
       auto_inject: "Enviar memória automaticamente ao Claude",
       auto_capture: 'Capturar quando o Claude escrever "MEMÓRIA: ..."',
-      editor: "Editor", updated: "Atualizada", pin_label: "Fixo no contexto", save: "Salvar",
+      editor: "Editor", updated: "Memória atualizada", pin_label: "Fixo no contexto", save: "Salvar",
       insert_chat: "Inserir na conversa", content_ph: "Conteúdo markdown do documento...",
       connect_title: "Conectar ao Claude do VS Code", enable_integration: "Ativar integração com o VS Code",
       connect_desc: "Com a integração ligada, o Claude do VS Code (ou Cursor/Windsurf) vê e depura suas páginas por esta extensão — inclusive abas em segundo plano. Rode uma vez para registrar o MCP no Claude Code, Cursor, VS Code e Windsurf:",
@@ -103,7 +103,7 @@
       insert_all: "Insert memory into chat", save_selection: "Save page selection",
       auto_inject: "Send memory to Claude automatically",
       auto_capture: 'Capture when Claude writes "MEMÓRIA: ..."',
-      editor: "Editor", updated: "Updated", pin_label: "Pinned in context", save: "Save",
+      editor: "Editor", updated: "Memory updated", pin_label: "Pinned in context", save: "Save",
       insert_chat: "Insert into chat", content_ph: "Document markdown content...",
       connect_title: "Connect to Claude in VS Code", enable_integration: "Enable VS Code integration",
       connect_desc: "With the integration on, Claude in VS Code (or Cursor/Windsurf) can see and debug your pages through this extension — including background tabs. Run once to register the MCP in Claude Code, Cursor, VS Code and Windsurf:",
@@ -135,7 +135,7 @@
       insert_all: "Insertar memoria en el chat", save_selection: "Guardar selección de la página",
       auto_inject: "Enviar memoria a Claude automáticamente",
       auto_capture: 'Capturar cuando Claude escriba "MEMÓRIA: ..."',
-      editor: "Editor", updated: "Actualizada", pin_label: "Fijo en contexto", save: "Guardar",
+      editor: "Editor", updated: "Memoria actualizada", pin_label: "Fijo en contexto", save: "Guardar",
       insert_chat: "Insertar en el chat", content_ph: "Contenido markdown del documento...",
       connect_title: "Conectar con Claude en VS Code", enable_integration: "Activar integración con VS Code",
       connect_desc: "Con la integración activada, Claude en VS Code (o Cursor/Windsurf) ve y depura tus páginas mediante esta extensión — incluidas pestañas en segundo plano. Ejecuta una vez para registrar el MCP en Claude Code, Cursor, VS Code y Windsurf:",
@@ -1116,6 +1116,8 @@
     panel.style.display = "flex";
     brandFooter();
     showScreen(screen || "list");
+    // ao abrir, re-checa versão (leve, throttle 60s no SW) → o card não mostra uma "latest" velha
+    try { chrome.runtime.sendMessage({ cm_update: "check", soft: true }, () => { void chrome.runtime.lastError; }); } catch (_) {}
     if (!screen || screen === "list") refreshList();
     else if (screen === "connect") refreshConnect();
     else if (screen === "history") refreshHistory();
@@ -1222,7 +1224,7 @@
       card.addEventListener("click", () => openDoc(d.name));
       list.appendChild(card);
     }
-    $("#cm-updated").textContent = t("updated") + ": " + (mem.updatedAt ? new Date(mem.updatedAt).toLocaleString() : "—");
+    $("#cm-updated").textContent = t("updated") + ": " + (mem.updatedAt ? new Date(mem.updatedAt).toLocaleString() : "—") + " · v" + (chrome.runtime.getManifest().version || "?");
   }
 
   // ---------------------------------------------------------------------------

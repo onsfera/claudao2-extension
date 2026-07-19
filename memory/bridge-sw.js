@@ -48,17 +48,23 @@
   }
   async function checkUpdate(force, minGapMs) {
     const now = Date.now();
-    // Throttle PERSISTIDO (o SW do MV3 morre e re-executa o topo, zerando qualquer var em memória):
-    // usa o ts do último resultado gravado. Boot checa mais ágil (minGapMs=5min); o alarm de 30s
-    // usa o default 6h. Assim reload do usuário reflete update novo rápido, sem over-fetch em background.
-    if (!force) { try { const prev = (await chrome.storage.local.get(UPDATE_KEY))[UPDATE_KEY]; if (prev && prev.ts && now - prev.ts < (minGapMs || 6 * 3600 * 1000)) return; } catch (_) {} }
+    const curVer = chrome.runtime.getManifest().version;
+    // Throttle PERSISTIDO (o SW do MV3 morre e re-executa o topo). Boot ágil (5min); alarm 6h; painel 60s.
+    // BYPASS se a versão RODANDO mudou desde o último check (reload/self-update): sem isso o card fica
+    // preso numa "latest" velha ou num "update disponível" já aplicado.
+    if (!force) {
+      try {
+        const prev = (await chrome.storage.local.get(UPDATE_KEY))[UPDATE_KEY];
+        const changed = prev && prev.current && prev.current !== curVer;
+        if (prev && prev.ts && !changed && now - prev.ts < (minGapMs || 6 * 3600 * 1000)) return;
+      } catch (_) {}
+    }
     try {
       const res = await fetch(MANIFEST_RAW + "?t=" + now, { cache: "no-store" });
       if (!res.ok) return;
       const m = await res.json();
       const latest = m && m.version; if (!latest) return;
-      const current = chrome.runtime.getManifest().version;
-      await chrome.storage.local.set({ [UPDATE_KEY]: { current, latest, hasUpdate: cmpVer(latest, current) > 0, url: REPO_URL, ts: now } });
+      await chrome.storage.local.set({ [UPDATE_KEY]: { current: curVer, latest, hasUpdate: cmpVer(latest, curVer) > 0, url: REPO_URL, ts: now } });
     } catch (_) {}
   }
   const LOG_KEY = "cm_bridge_log";          // ring buffer de ações (auditoria no painel)
@@ -247,7 +253,7 @@
         return true; // resposta assíncrona
       }
       // Auto-update: painel pede pra re-checar ou pra aplicar (git pull via bridge → reload).
-      if (msg && msg.cm_update === "check") { checkUpdate(true).then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false })); return true; }
+      if (msg && msg.cm_update === "check") { checkUpdate(!msg.soft, msg.soft ? 60000 : undefined).then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false })); return true; } // soft=abrir painel (60s); botão=force
       if (msg && msg.cm_update === "apply") {
         if (ws && ws.readyState === 1) { try { chrome.storage.local.set({ cm_update_state: { applying: true, ts: Date.now() } }); ws.send(JSON.stringify({ type: "cm_self_update" })); sendResponse({ ok: true }); } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); } }
         else sendResponse({ ok: false, error: "bridge não conectado" });
