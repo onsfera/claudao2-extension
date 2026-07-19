@@ -285,6 +285,7 @@
     if (changes[HANDOFF_KEY]) applyHandoff(changes[HANDOFF_KEY].newValue);
     if (changes[STATUS_KEY] || changes[ENABLED_KEY] || changes[PATHS_KEY]) refreshConnect();
     if ((changes["cm_update"] || changes["cm_update_state"] || changes[STATUS_KEY]) && panel && panel.style.display !== "none" && (curScreen === "list" || curScreen === "connect")) renderUpdateCard(); // slot existe nas 2 telas; sem "connect" o botão "Atualizar agora" trava em "Atualizando…" se o git falhar
+    if (changes["cm_update"]) updateMemBadge(); // bolinha de atenção no ícone da memória (independe do painel estar aberto)
     if (changes[CONSENT_KEY]) applyConsent(changes[CONSENT_KEY].newValue);
     if ((changes[LOG_KEY] || changes[ALLOW_KEY]) && curScreen === "security") refreshSecurity();
     if (changes[VAULT_KEY] && curScreen === "vault") refreshVault();
@@ -1400,6 +1401,7 @@
     anchor.parentElement.insertBefore(memBtn, histBtn);
     anchor.parentElement.insertBefore(capBtn, memBtn);
     restyleCaptureBtn();
+    updateMemBadge();
   }
   // Reflete o estado do toggle de captura no botão do cabeçalho (cor/opacidade/tooltip).
   function restyleCaptureBtn() {
@@ -1408,6 +1410,28 @@
     b.style.color = on ? BRAND_ORANGE : "#9a958c";
     b.style.opacity = on ? ".92" : ".5";
     b.title = "Claudão² — " + (on ? t("capture_on_title") : t("capture_off_title"));
+  }
+  // Bolinha de atenção no ícone do cérebro (memória) quando há nova versão disponível.
+  async function updateMemBadge() {
+    const btn = document.getElementById("cm-topbtn"); if (!btn) return;
+    let latest = "";
+    try { const g = await chrome.storage.local.get("cm_update"); if (g.cm_update && g.cm_update.hasUpdate) latest = g.cm_update.latest || "•"; } catch (_) {}
+    let dot = btn.querySelector("#cm-topbtn-dot");
+    if (latest) {
+      if (!document.getElementById("cm-dot-style")) {
+        const st = document.createElement("style"); st.id = "cm-dot-style";
+        st.textContent = "@keyframes cmDotPulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.35);opacity:.55}}";
+        (document.head || document.documentElement).appendChild(st);
+      }
+      btn.style.position = "relative";
+      if (!dot) {
+        dot = document.createElement("span"); dot.id = "cm-topbtn-dot";
+        dot.style.cssText = "position:absolute;top:3px;right:3px;width:8px;height:8px;border-radius:50%;background:#ff4d4d;box-shadow:0 0 0 2px rgba(20,20,22,.55);pointer-events:none;animation:cmDotPulse 1.6s ease-in-out infinite;";
+        btn.appendChild(dot);
+      }
+      dot.title = "Claudão² — " + t("update_available", { v: latest });
+      dot.style.display = "block";
+    } else if (dot) { dot.style.display = "none"; }
   }
   function syncFabVisibility() {
     const fab = shadow && shadow.getElementById("fab");
