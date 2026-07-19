@@ -170,6 +170,7 @@
       conv_reopened: "Continuando esta conversa — é só escrever.", continuing: "Continuando", stop_continue: "Encerrar continuação", delete_conv_confirm: "Apagar esta conversa salva?",
       view_history: "Ver histórico", confirm_close: "Clique de novo para fechar e iniciar uma conversa nova", new_conversation: "Nova conversa iniciada.", today: "Hoje", yesterday: "Ontem", continue_here: "Continue escrevendo abaixo para seguir a conversa", back_to_list: "Voltar à lista de conversas",
       update_available: "Nova versão %v% disponível", view_on_github: "Ver no GitHub", update_now: "Atualizar agora", updating: "Atualizando…", update_failed: "Falha ao atualizar",
+      t_copied_short: "Copiado!", check_updates: "Verificar atualizações", checking: "Verificando…", up_to_date: "Você já está na versão mais recente.",
       conv_deleted: "Conversa apagada.", you: "Você", claude: "Claude", lang_changed: "Idioma alterado.",
       rename_conv: "Editar nome", delete_conv: "Excluir", rename_prompt: "Novo nome da conversa:", cancel: "Cancelar",
     },
@@ -179,6 +180,7 @@
       conv_reopened: "Continuing this conversation — just type.", continuing: "Continuing", stop_continue: "Stop continuing", delete_conv_confirm: "Delete this saved conversation?",
       view_history: "View history", confirm_close: "Click again to close and start a new conversation", new_conversation: "New conversation started.", today: "Today", yesterday: "Yesterday", continue_here: "Keep typing below to continue the conversation", back_to_list: "Back to conversation list",
       update_available: "New version %v% available", view_on_github: "View on GitHub", update_now: "Update now", updating: "Updating…", update_failed: "Update failed",
+      t_copied_short: "Copied!", check_updates: "Check for updates", checking: "Checking…", up_to_date: "You're on the latest version.",
       conv_deleted: "Conversation deleted.", you: "You", claude: "Claude", lang_changed: "Language changed.",
       rename_conv: "Rename", delete_conv: "Delete", rename_prompt: "New conversation name:", cancel: "Cancel",
     },
@@ -188,6 +190,7 @@
       conv_reopened: "Continuando esta conversación — solo escribe.", continuing: "Continuando", stop_continue: "Terminar continuación", delete_conv_confirm: "¿Eliminar esta conversación guardada?",
       view_history: "Ver historial", confirm_close: "Haz clic de nuevo para cerrar e iniciar una conversación nueva", new_conversation: "Nueva conversación iniciada.", today: "Hoy", yesterday: "Ayer", continue_here: "Sigue escribiendo abajo para continuar la conversación", back_to_list: "Volver a la lista de conversaciones",
       update_available: "Nueva versión %v% disponible", view_on_github: "Ver en GitHub", update_now: "Actualizar ahora", updating: "Actualizando…", update_failed: "Error al actualizar",
+      t_copied_short: "¡Copiado!", check_updates: "Buscar actualizaciones", checking: "Verificando…", up_to_date: "Estás en la última versión.",
       conv_deleted: "Conversación eliminada.", you: "Tú", claude: "Claude", lang_changed: "Idioma cambiado.",
       rename_conv: "Editar nombre", delete_conv: "Eliminar", rename_prompt: "Nuevo nombre de la conversación:", cancel: "Cancelar",
     },
@@ -1162,36 +1165,39 @@
   // Aviso de nova versão (a extensão é unpacked). "Ver no GitHub" sempre; "Atualizar agora" só se o
   // bridge está conectado (ele faz o git pull). O estado vem do service worker (checkUpdate → cm_update).
   async function renderUpdateCard() {
-    const slot = $("#cm-update-slot"); if (!slot) return;
-    slot.innerHTML = "";
+    const slots = shadow.querySelectorAll(".cm-update-slot"); if (!slots.length) return;
     let up = null, st = null, up2 = null;
     try { const g = await chrome.storage.local.get(["cm_update", STATUS_KEY, "cm_update_state"]); up = g.cm_update; st = g[STATUS_KEY]; up2 = g.cm_update_state; } catch (_) {}
-    if (!up || !up.hasUpdate) return;
     const bridgeUp = !!(st && st.hubConnected && Date.now() - (st.ts || 0) < 60000);
-    const card = h("div", { className: "cm-update-card" });
-    card.appendChild(h("div", { className: "cm-update-title", textContent: "✨ " + t("update_available", { v: up.latest }) }));
-    const row = h("div", { className: "cm-update-actions" });
-    const gh = h("button", { className: "cm-update-gh" }); gh.innerHTML = ico("external-link", 14) + " " + t("view_on_github");
-    gh.addEventListener("click", () => { try { chrome.tabs.create({ url: up.url }); } catch (_) { try { window.open(up.url, "_blank"); } catch (__) {} } });
-    row.appendChild(gh);
-    if (bridgeUp) {
-      const applying = !!(up2 && up2.applying && Date.now() - (up2.ts || 0) < 120000); // 120s > timeout do git (90s): se o WS cair no meio, o botão não trava eterno
-      const btn = h("button", { className: "cm-update-now" });
-      btn.innerHTML = applying ? t("updating") : ico("rotate-ccw", 14) + " " + t("update_now");
-      btn.disabled = applying;
-      btn.addEventListener("click", () => {
-        btn.disabled = true; btn.textContent = t("updating");
-        try {
-          chrome.runtime.sendMessage({ cm_update: "apply" }, (r) => {
-            if (!(r && r.ok)) { btn.disabled = false; btn.innerHTML = ico("rotate-ccw", 14) + " " + t("update_now"); toast((r && r.error) || t("update_failed"), false); }
-          });
-        } catch (_) { btn.disabled = false; }
-      });
-      row.appendChild(btn);
-    }
-    card.appendChild(row);
-    if (up2 && up2.ok === false && up2.error) card.appendChild(h("div", { className: "cm-update-err", textContent: "⚠ " + up2.error }));
-    slot.appendChild(card);
+    // um nó do DOM só existe num lugar → constrói um card novo por slot (lista + conexão)
+    slots.forEach((slot) => {
+      slot.innerHTML = "";
+      if (!up || !up.hasUpdate) return;
+      const card = h("div", { className: "cm-update-card" });
+      card.appendChild(h("div", { className: "cm-update-title", textContent: "✨ " + t("update_available", { v: up.latest }) }));
+      const row = h("div", { className: "cm-update-actions" });
+      const gh = h("button", { className: "cm-update-gh" }); gh.innerHTML = ico("external-link", 14) + " " + t("view_on_github");
+      gh.addEventListener("click", () => { try { chrome.tabs.create({ url: up.url }); } catch (_) { try { window.open(up.url, "_blank"); } catch (__) {} } });
+      row.appendChild(gh);
+      if (bridgeUp) {
+        const applying = !!(up2 && up2.applying && Date.now() - (up2.ts || 0) < 120000); // 120s > timeout do git (90s): se o WS cair no meio, o botão não trava eterno
+        const btn = h("button", { className: "cm-update-now" });
+        btn.innerHTML = applying ? t("updating") : ico("rotate-ccw", 14) + " " + t("update_now");
+        btn.disabled = applying;
+        btn.addEventListener("click", () => {
+          btn.disabled = true; btn.textContent = t("updating");
+          try {
+            chrome.runtime.sendMessage({ cm_update: "apply" }, (r) => {
+              if (!(r && r.ok)) { btn.disabled = false; btn.innerHTML = ico("rotate-ccw", 14) + " " + t("update_now"); toast((r && r.error) || t("update_failed"), false); }
+            });
+          } catch (_) { btn.disabled = false; }
+        });
+        row.appendChild(btn);
+      }
+      card.appendChild(row);
+      if (up2 && up2.ok === false && up2.error) card.appendChild(h("div", { className: "cm-update-err", textContent: "⚠ " + up2.error }));
+      slot.appendChild(card);
+    });
   }
   async function refreshList() {
     renderUpdateCard();
@@ -1257,8 +1263,31 @@
     $("#cm-editor").addEventListener("click", () => window.open(chrome.runtime.getURL("memory/editor.html"), "_blank"));
 
     $("#cm-copy").addEventListener("click", async () => {
+      const btn = $("#cm-copy");
       const cmd = shadow.getElementById("cm-cmd-text").textContent;
-      try { await navigator.clipboard.writeText(cmd); toast(t("t_copied")); } catch (_) { toast(t("t_copy_manual"), false); }
+      let ok = false;
+      try { await navigator.clipboard.writeText(cmd); ok = true; } catch (_) {
+        try { // fallback sem permissão de clipboard (textarea + execCommand)
+          const ta = document.createElement("textarea"); ta.value = cmd;
+          ta.style.cssText = "position:fixed;top:-9999px;left:-9999px;opacity:0;";
+          document.body.appendChild(ta); ta.focus(); ta.select();
+          ok = document.execCommand("copy"); ta.remove();
+        } catch (__) {}
+      }
+      if (ok) { // efeito "Copiado!" no próprio botão (restaura o rótulo canônico, resiste a duplo-clique)
+        if (btn._cmT) clearTimeout(btn._cmT);
+        btn.innerHTML = "✓ " + t("t_copied_short"); btn.classList.add("cm-copied");
+        btn._cmT = setTimeout(() => { btn.innerHTML = ico("copy", 14) + " " + t("copy_command"); btn.classList.remove("cm-copied"); btn._cmT = null; }, 1600);
+      } else { toast(t("t_copy_manual"), false); }
+    });
+    $("#cm-check-update").addEventListener("click", () => {
+      toast(t("checking"));
+      try {
+        chrome.runtime.sendMessage({ cm_update: "check" }, async () => {
+          await renderUpdateCard();
+          try { const g = await chrome.storage.local.get("cm_update"); if (!(g.cm_update && g.cm_update.hasUpdate)) toast(t("up_to_date")); } catch (_) {}
+        });
+      } catch (_) {}
     });
     $("#cm-bridge-enabled").addEventListener("change", async (e) => {
       await chrome.storage.local.set({ [ENABLED_KEY]: { on: e.target.checked, ts: Date.now() } });
@@ -1561,6 +1590,7 @@
     } catch (_) {}
     if (codeEl) codeEl.textContent = 'node "' + (realInstall || BRIDGE_INSTALL_PATH) + '"';
     if (chk) chk.checked = on;
+    renderUpdateCard(); // aviso de nova versão também aparece aqui na tela de conexão
     if (!dot || !txt) return;
     if (!on) { dot.className = "cm-dot off"; txt.textContent = t("st_disabled"); }
     else if (up) { dot.className = "cm-dot on"; txt.textContent = t("st_connected"); }
@@ -1822,7 +1852,7 @@
     </div>
 
     <div id="cm-screen-list" class="cm-screen">
-      <div id="cm-update-slot"></div>
+      <div class="cm-update-slot"></div>
       <div class="cm-hint">${t("pin_hint", { pin: ico("pin", 11) })}</div>
       <div id="cm-doclist"></div>
       <div class="cm-listactions">
@@ -1867,12 +1897,14 @@
 
     <div id="cm-screen-connect" class="cm-screen">
       <div class="cm-connect">
+        <div class="cm-update-slot"></div>
         <label class="cm-conn-toggle"><input type="checkbox" id="cm-bridge-enabled" /> <span>${t("enable_integration")}</span></label>
         <div class="cm-conn-status"><span class="cm-dot off" id="cm-conn-dot"></span> <span id="cm-conn-text"></span></div>
         <p class="cm-conn-p">${t("connect_desc")}</p>
         <div class="cm-cmd"><code id="cm-cmd-text"></code></div>
         <button id="cm-copy" class="cm-primary">${ico("copy", 14)} ${t("copy_command")}</button>
         <p class="cm-conn-hint">${t("connect_hint")}</p>
+        <button id="cm-check-update" class="cm-check-update">${ico("rotate-ccw", 12)} ${t("check_updates")}</button>
         <div class="cm-conn-nav">
           <button id="cm-go-security" class="cm-secbtn">${ico("shield", 15)} ${t("security")}</button>
           <button id="cm-go-vault" class="cm-secbtn">${ico("key", 15)} ${t("vault")}</button>
@@ -2125,6 +2157,9 @@
     .cm-update-now { background: var(--accent); color: #fff; border-color: var(--accent); }
     .cm-update-now:disabled { opacity: .6; cursor: default; }
     .cm-update-err { font-size: 11px; color: #ff6b6b; margin-top: 7px; }
+    .cm-check-update { display: inline-flex; align-items: center; gap: 5px; margin: 4px auto 0; padding: 4px 6px; background: none; border: none; color: var(--text); opacity: .5; font: 500 11.5px system-ui, sans-serif; cursor: pointer; }
+    .cm-check-update:hover { opacity: .85; text-decoration: underline; }
+    #cm-copy.cm-copied { background: #1f9d55 !important; border-color: #1f9d55 !important; color: #fff !important; }
 
     #toast { position: fixed; bottom: 72px; right: 18px; max-width: 320px; background: var(--head); color: var(--text);
       padding: 10px 14px; border-radius: 8px; box-shadow: 0 6px 20px var(--shadow); font-family: system-ui, sans-serif; font-size: 12px;

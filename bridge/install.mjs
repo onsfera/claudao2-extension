@@ -41,14 +41,20 @@ function staleBridgesOnPort(port) {
   const found = [];
   try {
     if (process.platform === "win32") {
-      const ps = "$c = Get-NetTCPConnection -LocalPort " + port + " -State Listen -ErrorAction SilentlyContinue;"
+      // OutputEncoding=UTF8: sem isso o PowerShell 5.1 emite a CommandLine no codepage do console
+      // (cp850/1252) e o "ã" de "Extensão" vira "�" no decode utf8 → a comparação falha e o bridge
+      // da PRÓPRIA pasta é reportado como "de outra pasta" (falso positivo).
+      const ps = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+        + "$c = Get-NetTCPConnection -LocalPort " + port + " -State Listen -ErrorAction SilentlyContinue;"
         + " foreach ($x in $c) { $p = Get-CimInstance Win32_Process -Filter (\\\"ProcessId=\\\" + $x.OwningProcess) -ErrorAction SilentlyContinue;"
         + " if ($p) { Write-Output ($x.OwningProcess.ToString() + '|' + $p.CommandLine) } }";
       const out = execSync("powershell -NoProfile -Command \"" + ps + "\"", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      const norm = (s) => s.replace(/\\/g, "/").normalize("NFC").toLowerCase();
+      const server = norm(SERVER);
       for (const line of out.split(/\r?\n/)) {
         const i = line.indexOf("|"); if (i < 0) continue;
         const pid = line.slice(0, i).trim(); const cmd = line.slice(i + 1);
-        if (/mcp-server\.mjs/i.test(cmd) && !cmd.replace(/\\/g, "/").includes(SERVER)) found.push({ pid, cmd: cmd.trim(), kill: "Stop-Process -Id " + pid + " -Force" });
+        if (/mcp-server\.mjs/i.test(cmd) && !norm(cmd).includes(server)) found.push({ pid, cmd: cmd.trim(), kill: "Stop-Process -Id " + pid + " -Force" });
       }
     } else {
       const out = execSync("lsof -nP -iTCP:" + port + " -sTCP:LISTEN -t 2>/dev/null || true", { encoding: "utf8" });
