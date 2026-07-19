@@ -284,7 +284,7 @@
     if (changes[PAUSE_KEY]) applyPaused(changes[PAUSE_KEY].newValue);
     if (changes[HANDOFF_KEY]) applyHandoff(changes[HANDOFF_KEY].newValue);
     if (changes[STATUS_KEY] || changes[ENABLED_KEY] || changes[PATHS_KEY]) refreshConnect();
-    if ((changes["cm_update"] || changes["cm_update_state"] || changes[STATUS_KEY]) && panel && panel.style.display !== "none" && curScreen === "list") renderUpdateCard();
+    if ((changes["cm_update"] || changes["cm_update_state"] || changes[STATUS_KEY]) && panel && panel.style.display !== "none" && (curScreen === "list" || curScreen === "connect")) renderUpdateCard(); // slot existe nas 2 telas; sem "connect" o botão "Atualizar agora" trava em "Atualizando…" se o git falhar
     if (changes[CONSENT_KEY]) applyConsent(changes[CONSENT_KEY].newValue);
     if ((changes[LOG_KEY] || changes[ALLOW_KEY]) && curScreen === "security") refreshSecurity();
     if (changes[VAULT_KEY] && curScreen === "vault") refreshVault();

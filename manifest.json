@@ -61,7 +61,7 @@
    "storage": {
       "managed_schema": "managed_schema.json"
    },
-   "version": "1.1.3",
+   "version": "1.1.4",
    "web_accessible_resources": [ {
       "matches": [ "https://*.claude.ai/*", "https://claude.ai/*" ],
       "resources": [ "memory/editor.html", "memory/core.js", "memory/editor.js", "memory/seed/*" ],
