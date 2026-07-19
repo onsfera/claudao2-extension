@@ -1583,10 +1583,19 @@
     }
     lock.style.top = Math.max(0, top) + "px"; lock.style.height = height + "px"; lock.style.left = "0"; lock.style.right = "0";
   }
-  function applyExternalState(st) {
+  async function applyExternalState(st) {
     if (!IS_SIDEPANEL || !shadow) return;
     ensureExternalUI();
-    const on = externalFresh(st);
+    let on = externalFresh(st);
+    if (on) {
+      // Escopo por aba: só sinaliza/trava se o Claude externo está agindo na aba ATIVA desta janela.
+      // Se ele age em OUTRA aba (ou em nenhuma específica), o usuário segue livre pra usar a extensão aqui.
+      let sameTab = false;
+      if (st && st.tab != null) {
+        try { const act = await chrome.tabs.query({ active: true, currentWindow: true }); sameTab = !!(act && act[0] && act[0].id === st.tab); } catch (_) {}
+      }
+      on = sameTab;
+    }
     const glow = shadow.getElementById("cm-extglow");
     const bar = shadow.getElementById("cm-extbar");
     const lock = shadow.getElementById("cm-extlock");
@@ -1861,7 +1870,10 @@
     buildUI();
     loadSettings().finally(startObservers);
     maybeShowAttribution();
-    if (IS_SIDEPANEL) { ensureExternalUI(); ensureConsentUI(); ensureHandoffUI(); pollExternal(); pollConsent(); pollPaused(); pollHandoff(); refreshConnect(); setInterval(() => { pollExternal(); pollConsent(); pollPaused(); pollHandoff(); }, 2500); }
+    if (IS_SIDEPANEL) { ensureExternalUI(); ensureConsentUI(); ensureHandoffUI(); pollExternal(); pollConsent(); pollPaused(); pollHandoff(); refreshConnect(); setInterval(() => { pollExternal(); pollConsent(); pollPaused(); pollHandoff(); }, 2500);
+      // troca de aba re-avalia o lock na hora (a trava só vale na aba que o Claude externo está agindo)
+      try { chrome.tabs.onActivated.addListener(() => pollExternal()); } catch (_) {}
+    }
   }
 
   // ---------------------------------------------------------------------------
