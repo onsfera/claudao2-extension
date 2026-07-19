@@ -46,11 +46,12 @@
     for (let i = 0; i < Math.max(pa.length, pb.length); i++) { const x = parseInt(pa[i] || "0", 10), y = parseInt(pb[i] || "0", 10); if (x !== y) return x - y; }
     return 0;
   }
-  async function checkUpdate(force) {
+  async function checkUpdate(force, minGapMs) {
     const now = Date.now();
     // Throttle PERSISTIDO (o SW do MV3 morre e re-executa o topo, zerando qualquer var em memória):
-    // usa o ts do último resultado gravado. No máx 1x a cada 6h (o alarm dispara a cada 30s).
-    if (!force) { try { const prev = (await chrome.storage.local.get(UPDATE_KEY))[UPDATE_KEY]; if (prev && prev.ts && now - prev.ts < 6 * 3600 * 1000) return; } catch (_) {} }
+    // usa o ts do último resultado gravado. Boot checa mais ágil (minGapMs=5min); o alarm de 30s
+    // usa o default 6h. Assim reload do usuário reflete update novo rápido, sem over-fetch em background.
+    if (!force) { try { const prev = (await chrome.storage.local.get(UPDATE_KEY))[UPDATE_KEY]; if (prev && prev.ts && now - prev.ts < (minGapMs || 6 * 3600 * 1000)) return; } catch (_) {} }
     try {
       const res = await fetch(MANIFEST_RAW + "?t=" + now, { cache: "no-store" });
       if (!res.ok) return;
@@ -284,7 +285,7 @@
     } catch (_) {}
     if (enabled) connect();
   })();
-  checkUpdate(); // checa nova versão no boot (e depois a cada 6h pelo alarm)
+  checkUpdate(false, 5 * 60 * 1000); // checa nova versão no boot (mais ágil: 5min; o alarm segue 6h)
 
   // Instalou/recarregou a extensão = pode ter TROCADO de pasta/bridge. O caminho exibido
   // (cm_bridge_paths) é herança do ÚLTIMO bridge que conectou — se era o de outra pasta, ficava
