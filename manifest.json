@@ -27,6 +27,11 @@
       "world": "MAIN",
       "all_frames": false
    }, {
+      "js": [ "memory/native-watch.js" ],
+      "matches": [ "<all_urls>" ],
+      "run_at": "document_start",
+      "all_frames": false
+   }, {
       "js": [ "assets/content-script.ts-loader-DKJzsl7H.js" ],
       "matches": [ "https://claude.ai/*", "https://*.claude.ai/*" ],
       "run_at": "document_end"
@@ -61,7 +66,7 @@
    "storage": {
       "managed_schema": "managed_schema.json"
    },
-   "version": "1.1.10",
+   "version": "1.1.11",
    "web_accessible_resources": [ {
       "matches": [ "https://*.claude.ai/*", "https://claude.ai/*" ],
       "resources": [ "memory/editor.html", "memory/core.js", "memory/editor.js", "memory/seed/*" ],

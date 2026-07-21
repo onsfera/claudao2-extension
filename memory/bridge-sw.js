@@ -259,6 +259,16 @@
         else sendResponse({ ok: false, error: "bridge não conectado" });
         return true;
       }
+      // Agente NATIVO do painel: o memory/native-watch.js escuta os avisos que o nativo manda pra aba
+      // e repassa aqui. "show"/"hide" também são heartbeat — o "on" é evento de borda (não se repete
+      // por ação) e o nosso glow expira sozinho se não for renovado.
+      if (msg && msg.cm_native && sender && sender.tab) {
+        const tid = sender.tab.id;
+        if (msg.cm_native === "on" || msg.cm_native === "show") markNative(tid);
+        else if (msg.cm_native === "hide") glowVisible(tid, false);
+        else if (msg.cm_native === "off") { glowedTabs.delete(tid); glow(tid, false); }
+        return;
+      }
       // Pausa/Retoma GRANULAR: a página não sabe seu tabId → o SW pega de sender.tab.id.
       if (msg && msg.cm_pause && sender && sender.tab) { pauseTab(sender.tab.id, msg.reason); return; }
       if (msg && msg.cm_resume && sender && sender.tab) { resumeTab(sender.tab.id); return; }
@@ -723,11 +733,15 @@
   // Injeta na aba: borda neon + botão "Parar Claude" + auto-pausa se o usuário mexer.
   // O overlay renova um timestamp e se remove sozinho se não for renovado (backstop
   // contra o service worker dormir). glowedTabs garante a limpeza multi-aba explícita.
-  async function glow(tabId, on, client) {
+  // native=true (agente do PRÓPRIO painel): acende só o sinal (borda + favicon + título) e NÃO cria o
+  // botão "Parar" (o nativo tem o dele; o nosso pausaria só o canal da ponte externa, dando falsa
+  // sensação de parada) nem arma a auto-pausa por cliques (os cliques do nativo são CDP e chegam
+  // isTrusted, então 3 deles pausariam sozinhos).
+  async function glow(tabId, on, client, native) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
-        func: (show, label, ttl, str) => {
+        func: (show, label, ttl, str, native) => {
           const IDS = ["__claudao_glow__", "__claudao_cursor__", "__claudao_marks__", "__claudao_stop__"];
           // Restaura o sinal DA ABA (favicon + título) ao valor original.
           const cmClearTab = () => {
@@ -749,7 +763,7 @@
             const s = document.createElement("style"); s.textContent = "@keyframes __claudaoGlow{0%,100%{opacity:.55}50%{opacity:1}}";
             d.appendChild(s); (document.body || document.documentElement).appendChild(d);
           }
-          if (!document.getElementById("__claudao_stop__")) {
+          if (!native && !document.getElementById("__claudao_stop__")) {
             const btn = document.createElement("button"); btn.id = "__claudao_stop__";
             btn.innerHTML = "⏸ " + str.pause + (label ? " <span style='opacity:.7;font-weight:400'>· " + String(label).slice(0, 48) + "</span>" : ""); // 48: cabe "claude-code · <projeto>" (multi-janela)
             btn.style.cssText = "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#c0392b;color:#fff;border:none;border-radius:9px;padding:8px 16px;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 3px 14px rgba(0,0,0,.45);pointer-events:auto;";
@@ -801,7 +815,7 @@
           // Auto-pausa: 3 CLIQUES do usuário em 10s NESTA aba (e só com glow ativo = o Claude está/
           // esteve agindo aqui) = "assumi o controle". NÃO pausa em clique único nem em tecla, e nunca
           // em aba que o Claude não está tocando (sem glow = sem gate). O botão pausa direto.
-          if (!window.__claudaoTakeoverBound) {
+          if (!native && !window.__claudaoTakeoverBound) {
             window.__claudaoTakeoverBound = true;
             window.__claudaoClicks = [];
             const onClick = (ev) => {
@@ -817,7 +831,27 @@
             addEventListener("mousedown", onClick, true);
           }
         },
-        args: [!!on, client || "", GLOW_TTL_MS, PAGE_STR[uiLang]],
+        args: [!!on, client || "", GLOW_TTL_MS, PAGE_STR[uiLang], !!native],
+      });
+    } catch (_) {}
+  }
+
+  // Agente NATIVO do painel agindo nesta aba: só acende o sinal. NÃO mexe em ACTIVE_KEY, que é do
+  // Claude EXTERNO — senão o painel mostraria "Extensão em interação com o Claude externo", que é falso.
+  async function markNative(tabId) {
+    if (!tabId || pausedTabs.has(tabId)) return;
+    glowedTabs.add(tabId);
+    await glow(tabId, true, "", true);
+    glowVisible(tabId, true);
+  }
+  // Esconde/mostra o nosso overlay SEM remover: o nativo esconde os indicadores dele antes de clicar ou
+  // capturar tela; se o nosso ficasse visível, entraria na imagem que vai pro modelo.
+  async function glowVisible(tabId, vis) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (v) => { const g = document.getElementById("__claudao_glow__"); if (g) g.style.display = v ? "" : "none"; },
+        args: [!!vis],
       });
     } catch (_) {}
   }

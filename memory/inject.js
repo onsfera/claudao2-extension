@@ -309,6 +309,67 @@
     } catch (_) {}
     return "";
   }
+  // ---------------------------------------------------------------------------
+  // Imagens: a API recusa dimensão acima do limite (2000px em request com várias
+  // imagens). Pior que o erro: a imagem grande FICA NO HISTÓRICO e passa a quebrar
+  // TODA mensagem seguinte — a conversa "trava". Por isso reduzimos toda imagem do
+  // payload antes de enviar, inclusive as antigas: isso cura o histórico sozinho.
+  // ---------------------------------------------------------------------------
+  const IMG_MAX_DIM = 1568; // maior lado; folgado abaixo do teto de 2000 e é o tamanho que o Claude já usa
+  function b64ToBlob(b64, type) {
+    const bin = atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new Blob([arr], { type: type || "image/png" });
+  }
+  function blobToB64(blob) {
+    return new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => { const s = String(fr.result || ""); const i = s.indexOf(","); res(i >= 0 ? s.slice(i + 1) : ""); };
+      fr.onerror = rej;
+      fr.readAsDataURL(blob);
+    });
+  }
+  // Todo envio remanda o histórico inteiro → sem cache redecodificaríamos cada imagem a cada
+  // mensagem. Guarda a impressão digital das que já sabemos estar dentro do limite.
+  const imgOkCache = new Set();
+  const imgKey = (d) => d.length + ":" + d.slice(0, 24) + d.slice(-16);
+  async function shrinkOneImage(src) {
+    try {
+      if (!src || src.type !== "base64" || !src.data) return false;
+      const key0 = imgKey(src.data);
+      if (imgOkCache.has(key0)) return false;
+      const bmp = await createImageBitmap(b64ToBlob(src.data, src.media_type));
+      const w = bmp.width, h = bmp.height, m = Math.max(w, h);
+      if (!m || m <= IMG_MAX_DIM) { if (bmp.close) bmp.close(); if (imgOkCache.size > 300) imgOkCache.clear(); imgOkCache.add(key0); return false; }
+      const k = IMG_MAX_DIM / m;
+      const cv = new OffscreenCanvas(Math.max(1, Math.round(w * k)), Math.max(1, Math.round(h * k)));
+      cv.getContext("2d").drawImage(bmp, 0, 0, cv.width, cv.height);
+      if (bmp.close) bmp.close();
+      const b64 = await blobToB64(await cv.convertToBlob({ type: "image/jpeg", quality: 0.92 }));
+      if (!b64) return false;
+      src.data = b64; src.media_type = "image/jpeg";
+      if (imgOkCache.size > 300) imgOkCache.clear();
+      imgOkCache.add(imgKey(b64)); // a reduzida já está dentro do limite
+      return true;
+    } catch (_) { return false; }
+  }
+  async function shrinkInContent(arr) {
+    if (!Array.isArray(arr)) return false;
+    let changed = false;
+    for (const blk of arr) {
+      if (!blk) continue;
+      if (blk.type === "image" && blk.source) { if (await shrinkOneImage(blk.source)) changed = true; }
+      else if (Array.isArray(blk.content)) { if (await shrinkInContent(blk.content)) changed = true; } // tool_result com imagem
+    }
+    return changed;
+  }
+  async function shrinkImages(payload) {
+    let changed = false;
+    try { for (const msg of (payload.messages || [])) { if (msg && Array.isArray(msg.content) && await shrinkInContent(msg.content)) changed = true; } } catch (_) {}
+    return changed;
+  }
+
   function patchFetch() {
     if (!IS_SIDEPANEL) return;
     const orig = window.fetch;
@@ -323,8 +384,11 @@
           else if (typeof Request !== "undefined" && input instanceof Request) bodyText = await input.clone().text();
           if (bodyText) {
             const payload = JSON.parse(bodyText);
+            let modified = false;
+            // Roda ANTES e independente do isUtilityCall: imagem grande quebra qualquer request e,
+            // ficando no histórico, quebraria todos os próximos. Reduzir aqui cura a conversa travada.
+            if (payload && Array.isArray(payload.messages) && await shrinkImages(payload)) modified = true;
             if (payload && Array.isArray(payload.messages) && !isUtilityCall(payload.messages)) {
-              let modified = false;
               const nativeMsgs = payload.messages || [];   // native ANTES do buildResumed
               const beforeLen = nativeMsgs.length;
               handleOutgoing(payload);                 // sessão + continuação (pode setar payload.messages = buildResumed)
@@ -362,11 +426,11 @@
                 if (ut && ut !== ovLastUser) { ovLastUser = ut; ovAppendUser(ut); } // nova mensagem do usuário (o loop de tools tem ut vazio)
                 doTap = true;
               }
-              if (modified) {
-                const newBody = JSON.stringify(payload);
-                if (init && typeof init.body === "string") init = { ...init, body: newBody };
-                else input = new Request(input, { body: newBody, method: "POST" });
-              }
+            }
+            if (modified) {
+              const newBody = JSON.stringify(payload);
+              if (init && typeof init.body === "string") init = { ...init, body: newBody };
+              else input = new Request(input, { body: newBody, method: "POST" });
             }
           }
         }
